@@ -9,3 +9,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "milagre"
 path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
