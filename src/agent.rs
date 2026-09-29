@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use crate::{Coordinator, Id};
+use crate::{ActionAuthorization, Coordinator, Id, OperationKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentCommand {
@@ -156,11 +156,22 @@ impl AgentRuntime {
         Ok(())
     }
 
-    pub fn send(&mut self, session_id: Id, input: &str) -> io::Result<()> {
-        self.sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "agent is not running"))?
-            .send(input)
+    pub fn send_operation(
+        &mut self,
+        coordinator: &mut Coordinator,
+        session_id: Id,
+        input: &str,
+        operation: OperationKind,
+        description: impl Into<String>,
+    ) -> Result<ActionAuthorization, anyhow::Error> {
+        let authorization = coordinator.authorize_operation(session_id, operation, description);
+        if authorization == ActionAuthorization::Allowed {
+            self.sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("agent is not running"))?
+                .send(input)?;
+        }
+        Ok(authorization)
     }
 
     pub fn poll_output(
@@ -185,9 +196,7 @@ impl AgentRuntime {
             .remove(&session_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "agent is not running"))?;
         pty.kill()?;
-        if let Some(session) = coordinator.sessions.get_mut(&session_id) {
-            session.status = crate::SessionStatus::Stopped;
-        }
+        coordinator.stop_session(session_id);
         Ok(())
     }
 }
@@ -264,5 +273,52 @@ mod tests {
         }
 
         panic!("runtime did not produce output");
+    }
+
+    #[test]
+    fn runtime_blocks_high_risk_commands_until_approval() {
+        let mut coordinator = Coordinator::new();
+        let project = coordinator.add_project("ADE demo");
+        let worktree = coordinator.add_worktree(project, "api", "/tmp/api");
+        let session = coordinator.start_session(worktree, "fake-agent");
+        let mut runtime = AgentRuntime::default();
+        runtime
+            .start(
+                &mut coordinator,
+                session,
+                AgentCommand::new("/bin/sh")
+                    .arg("-c")
+                    .arg("read line; printf 'received:%s' \"$line\""),
+            )
+            .expect("runtime should start");
+
+        let authorization = runtime
+            .send_operation(
+                &mut coordinator,
+                session,
+                "rm -rf important\n",
+                OperationKind::Destructive,
+                "Delete important files",
+            )
+            .expect("authorization should be returned");
+        assert!(matches!(
+            authorization,
+            ActionAuthorization::RequiresApproval(_)
+        ));
+        assert_eq!(coordinator.approvals.len(), 1);
+
+        let authorization = runtime
+            .send_operation(
+                &mut coordinator,
+                session,
+                "safe edit\n",
+                OperationKind::Edit,
+                "Edit source",
+            )
+            .expect("ordinary edit should be sent");
+        assert_eq!(authorization, ActionAuthorization::Allowed);
+        runtime
+            .stop(&mut coordinator, session)
+            .expect("stop should work");
     }
 }

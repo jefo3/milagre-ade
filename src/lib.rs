@@ -98,6 +98,7 @@ pub struct ChatMessage {
     pub id: Id,
     pub session_id: Id,
     pub body: String,
+    pub context: Option<ContextPacket>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,12 +108,45 @@ pub enum RiskLevel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationKind {
+    Edit,
+    Destructive,
+    Merge,
+    Publication,
+    Installation,
+    OutsideWorktree,
+    Custom,
+}
+
+impl OperationKind {
+    pub fn risk(&self) -> RiskLevel {
+        match self {
+            Self::Edit => RiskLevel::Low,
+            Self::Destructive
+            | Self::Merge
+            | Self::Publication
+            | Self::Installation
+            | Self::OutsideWorktree
+            | Self::Custom => RiskLevel::High,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: Id,
     pub session_id: Id,
     pub description: String,
+    pub operation: OperationKind,
     pub risk: RiskLevel,
     pub approved: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionAuthorization {
+    Allowed,
+    RequiresApproval(Id),
+    Denied(Id),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +316,22 @@ impl Coordinator {
             },
         );
         id
+    }
+
+    pub fn stop_session(&mut self, session_id: Id) {
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .expect("session must exist");
+        session.status = SessionStatus::Stopped;
+    }
+
+    pub fn set_session_status(&mut self, session_id: Id, status: SessionStatus) {
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .expect("session must exist");
+        session.status = status;
     }
 
     pub fn connect(
@@ -462,15 +512,31 @@ impl Coordinator {
     }
 
     pub fn send_message(&mut self, session_id: Id, body: impl Into<String>) -> Id {
+        self.send_message_with_context(session_id, body, false)
+    }
+
+    pub fn send_message_with_context(
+        &mut self,
+        session_id: Id,
+        body: impl Into<String>,
+        include_context: bool,
+    ) -> Id {
         assert!(
             self.sessions.contains_key(&session_id),
             "session must exist"
         );
+        let context = if include_context {
+            let worktree_id = self.sessions[&session_id].worktree_id;
+            Some(self.context_for(worktree_id))
+        } else {
+            None
+        };
         let id = self.id();
         self.messages.push(ChatMessage {
             id,
             session_id,
             body: body.into(),
+            context,
         });
         id
     }
@@ -490,10 +556,41 @@ impl Coordinator {
             id,
             session_id,
             description: description.into(),
+            operation: OperationKind::Custom,
             risk,
             approved: None,
         });
         id
+    }
+
+    pub fn authorize_operation(
+        &mut self,
+        session_id: Id,
+        operation: OperationKind,
+        description: impl Into<String>,
+    ) -> ActionAuthorization {
+        let description = description.into();
+        let risk = operation.risk();
+        if risk == RiskLevel::Low {
+            return ActionAuthorization::Allowed;
+        }
+        if let Some(existing) = self.approvals.iter().rev().find(|approval| {
+            approval.session_id == session_id
+                && approval.operation == operation
+                && approval.description == description
+        }) {
+            return self.authorization_for(existing.id);
+        }
+        let approval_id = self.id();
+        self.approvals.push(ApprovalRequest {
+            id: approval_id,
+            session_id,
+            description,
+            operation,
+            risk,
+            approved: None,
+        });
+        ActionAuthorization::RequiresApproval(approval_id)
     }
 
     pub fn approve(&mut self, approval_id: Id, approved: bool) {
@@ -503,6 +600,19 @@ impl Coordinator {
             .find(|request| request.id == approval_id)
             .expect("approval must exist");
         request.approved = Some(approved);
+    }
+
+    pub fn authorization_for(&self, approval_id: Id) -> ActionAuthorization {
+        let request = self
+            .approvals
+            .iter()
+            .find(|request| request.id == approval_id)
+            .expect("approval must exist");
+        match request.approved {
+            None => ActionAuthorization::RequiresApproval(approval_id),
+            Some(true) => ActionAuthorization::Allowed,
+            Some(false) => ActionAuthorization::Denied(approval_id),
+        }
     }
 
     pub fn expire_temporary_connections(&mut self) -> usize {
@@ -740,6 +850,34 @@ mod tests {
 
         assert_eq!(coordinator.messages[0].session_id, session);
         assert_eq!(coordinator.messages[0].body, "Please inspect the contract.");
+        assert!(coordinator.messages[0].context.is_none());
+    }
+
+    #[test]
+    fn chat_can_attach_only_the_selected_agents_relevant_context() {
+        let mut coordinator = Coordinator::new();
+        let project = coordinator.add_project("ADE demo");
+        let first = coordinator.add_worktree(project, "api", "/tmp/api");
+        let second = coordinator.add_worktree(project, "web", "/tmp/web");
+        let first_session = coordinator.start_session(first, "fake-agent-a");
+        let second_session = coordinator.start_session(second, "fake-agent-b");
+        coordinator.connect(
+            first,
+            second,
+            ConnectionType::Information,
+            ConnectionLifetime::Persistent,
+        );
+        coordinator.publish(first, EventKind::Decision, "Use v1", "API contract.");
+
+        coordinator.send_message_with_context(second_session, "Please verify the contract.", true);
+
+        assert_eq!(coordinator.messages.len(), 1);
+        assert_ne!(coordinator.messages[0].session_id, first_session);
+        let context = coordinator.messages[0]
+            .context
+            .as_ref()
+            .expect("context should be attached");
+        assert!(context.summary.contains("Use v1"));
     }
 
     #[test]
@@ -753,6 +891,40 @@ mod tests {
         assert_eq!(coordinator.approvals[0].approved, None);
         coordinator.approve(approval, true);
         assert_eq!(coordinator.approvals[0].approved, Some(true));
+    }
+
+    #[test]
+    fn operation_authorization_only_interrupts_high_risk_actions() {
+        let mut coordinator = Coordinator::new();
+        let project = coordinator.add_project("ADE demo");
+        let worktree = coordinator.add_worktree(project, "api", "/tmp/api");
+        let session = coordinator.start_session(worktree, "fake-agent");
+
+        assert_eq!(
+            coordinator.authorize_operation(session, OperationKind::Edit, "Edit source"),
+            ActionAuthorization::Allowed
+        );
+        let approval = match coordinator.authorize_operation(
+            session,
+            OperationKind::Publication,
+            "Publish package",
+        ) {
+            ActionAuthorization::RequiresApproval(id) => id,
+            other => panic!("expected approval, got {other:?}"),
+        };
+        assert_eq!(
+            coordinator.authorization_for(approval),
+            ActionAuthorization::RequiresApproval(approval)
+        );
+        coordinator.approve(approval, false);
+        assert_eq!(
+            coordinator.authorization_for(approval),
+            ActionAuthorization::Denied(approval)
+        );
+        assert_eq!(
+            coordinator.authorize_operation(session, OperationKind::Publication, "Publish package"),
+            ActionAuthorization::Denied(approval)
+        );
     }
 
     #[test]
@@ -904,5 +1076,71 @@ mod tests {
             std::fs::read_to_string(context_path).expect("context file should be readable");
         assert!(contents.contains("Contract first"));
         std::fs::remove_dir_all(root).expect("test context directory should be removed");
+    }
+
+    #[test]
+    fn vertical_slice_coordinates_two_fake_agents_end_to_end() {
+        struct FakeAgent {
+            session_id: Id,
+        }
+
+        impl FakeAgent {
+            fn publish(&self, coordinator: &mut Coordinator, worktree_id: Id, summary: &str) {
+                assert!(coordinator.sessions.contains_key(&self.session_id));
+                coordinator.publish(
+                    worktree_id,
+                    EventKind::Decision,
+                    summary,
+                    "fake agent event",
+                );
+            }
+        }
+
+        let mut coordinator = Coordinator::new();
+        let project = coordinator.add_project("Vertical slice");
+        let api = coordinator.add_worktree(project, "api", "/tmp/api");
+        let web = coordinator.add_worktree(project, "web", "/tmp/web");
+        let api_session = coordinator.start_session(api, "fake-api");
+        let web_session = coordinator.start_session(web, "fake-web");
+        let api_agent = FakeAgent {
+            session_id: api_session,
+        };
+        let web_agent = FakeAgent {
+            session_id: web_session,
+        };
+        coordinator.connect(
+            api,
+            web,
+            ConnectionType::Information,
+            ConnectionLifetime::Persistent,
+        );
+
+        api_agent.publish(&mut coordinator, api, "API contract ready");
+        assert!(coordinator
+            .context_for(web)
+            .summary
+            .contains("API contract ready"));
+        web_agent.publish(&mut coordinator, web, "Client verified contract");
+        assert!(coordinator
+            .context_for(api)
+            .summary
+            .contains("Client verified contract"));
+
+        coordinator.send_message_with_context(
+            web_session,
+            "Continue with the shared contract.",
+            true,
+        );
+        assert!(coordinator.messages[0]
+            .context
+            .as_ref()
+            .expect("message context")
+            .summary
+            .contains("API contract ready"));
+        coordinator.stop_session(web_session);
+        assert_eq!(
+            coordinator.sessions[&web_session].status,
+            SessionStatus::Stopped
+        );
     }
 }

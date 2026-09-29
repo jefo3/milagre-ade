@@ -1,7 +1,9 @@
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, MouseButton, SharedString,
-    Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, MouseButton,
+    SharedString, Window, WindowBounds, WindowOptions,
 };
+use std::fs;
+use std::path::Path;
 
 use milagre::{ConnectionLifetime, ConnectionType, Coordinator, EventKind};
 
@@ -14,10 +16,73 @@ struct WorkspaceView {
     drag_origin: Option<u64>,
     connection_kind: ConnectionType,
     connection_lifetime: ConnectionLifetime,
+    composer: String,
+    focus_handle: FocusHandle,
+}
+
+struct WorktreeCardData<'a> {
+    name: &'a str,
+    agent: &'a str,
+    status: &'a str,
+    context_count: usize,
+    selected: bool,
+    attention: bool,
+    task_count: usize,
+    artifact_count: usize,
+    next_action: &'a str,
+}
+
+impl Drop for WorkspaceView {
+    fn drop(&mut self) {
+        self.persist();
+    }
+}
+
+impl WorkspaceView {
+    fn persist(&self) {
+        let directory = Path::new(".milagre");
+        if fs::create_dir_all(directory).is_ok() {
+            let _ = self.coordinator.save(directory.join("coordination.json"));
+        }
+    }
+
+    fn send_composer_message(&mut self) {
+        let body = self.composer.trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        if let Some(session_id) = self.selected_recipient {
+            self.coordinator
+                .send_message_with_context(session_id, body, true);
+            self.composer.clear();
+        }
+    }
+
+    fn toggle_session(&mut self, worktree_id: u64) {
+        let Some(session_id) = self
+            .coordinator
+            .sessions
+            .values()
+            .find(|session| session.worktree_id == worktree_id)
+            .map(|session| session.id)
+        else {
+            return;
+        };
+        if matches!(
+            self.coordinator.sessions[&session_id].status,
+            milagre::SessionStatus::Running
+        ) {
+            self.coordinator.stop_session(session_id);
+        } else {
+            self.coordinator
+                .set_session_status(session_id, milagre::SessionStatus::Running);
+        }
+    }
 }
 
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.persist();
         let left = self
             .coordinator
             .worktrees
@@ -54,6 +119,24 @@ impl Render for WorkspaceView {
             .values()
             .filter(|artifact| artifact.worktree_id == self.right_worktree)
             .count();
+        let left_next_action = self
+            .coordinator
+            .tasks
+            .values()
+            .find(|task| {
+                task.worktree_id == self.left_worktree && task.status != milagre::TaskStatus::Done
+            })
+            .map(|task| task.title.as_str())
+            .unwrap_or("No next action");
+        let right_next_action = self
+            .coordinator
+            .tasks
+            .values()
+            .find(|task| {
+                task.worktree_id == self.right_worktree && task.status != milagre::TaskStatus::Done
+            })
+            .map(|task| task.title.as_str())
+            .unwrap_or("No next action");
         let left_session = self
             .coordinator
             .sessions
@@ -66,11 +149,44 @@ impl Render for WorkspaceView {
             .find(|session| session.worktree_id == self.right_worktree);
         let left_session_id = left_session.map(|session| session.id);
         let right_session_id = right_session.map(|session| session.id);
+        let left_status = left_session
+            .map(|session| format_session_status(&session.status))
+            .unwrap_or("not started".to_string());
+        let right_status = right_session
+            .map(|session| format_session_status(&session.status))
+            .unwrap_or("not started".to_string());
+        let left_lifecycle_label = if left_status == "running" {
+            "Stop API agent"
+        } else {
+            "Start API agent"
+        };
+        let right_lifecycle_label = if right_status == "running" {
+            "Stop web agent"
+        } else {
+            "Start web agent"
+        };
         let selected_name = self
             .selected_recipient
             .and_then(|id| self.coordinator.sessions.get(&id))
             .map(|session| session.agent_name.as_str())
             .unwrap_or("nenhum agente selecionado");
+        let chat_history = self
+            .coordinator
+            .messages
+            .iter()
+            .rev()
+            .take(3)
+            .map(|message| {
+                let recipient = self
+                    .coordinator
+                    .sessions
+                    .get(&message.session_id)
+                    .map(|session| session.agent_name.as_str())
+                    .unwrap_or("unknown agent");
+                format!("{} → {}", recipient, message.body)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let pending_approvals = self
             .coordinator
             .approvals
@@ -84,6 +200,24 @@ impl Render for WorkspaceView {
                 .iter()
                 .filter(|conflict| conflict.blocked)
                 .count();
+        let pending_approval_id = self
+            .coordinator
+            .approvals
+            .iter()
+            .find(|approval| approval.approved.is_none())
+            .map(|approval| approval.id);
+        let blocked_conflicts = self
+            .coordinator
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.blocked)
+            .count();
+        let low_risk_conflicts = self
+            .coordinator
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.risk == milagre::RiskLevel::Low)
+            .count();
         let connection_label = self
             .coordinator
             .connections
@@ -96,6 +230,41 @@ impl Render for WorkspaceView {
             .and_then(|session_id| self.coordinator.latest_output_for(session_id))
             .map(|output| output.raw.clone())
             .unwrap_or_else(|| "No raw output captured yet.".to_string());
+        let output_summary = self
+            .selected_recipient
+            .and_then(|session_id| self.coordinator.latest_output_for(session_id))
+            .map(|output| output.summary.clone())
+            .unwrap_or_else(|| "No concise agent summary captured yet.".to_string());
+        let selected_worktree_id = self
+            .selected_recipient
+            .and_then(|session_id| self.coordinator.sessions.get(&session_id))
+            .map(|session| session.worktree_id);
+        let artifact_summary = selected_worktree_id
+            .map(|worktree_id| {
+                self.coordinator
+                    .artifacts
+                    .values()
+                    .filter(|artifact| artifact.worktree_id == worktree_id)
+                    .map(|artifact| {
+                        format!(
+                            "{} · {}\n{}",
+                            artifact.label, artifact.path, artifact.content
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| "No diff or artifact selected.".to_string());
+        let timeline_summary = self
+            .coordinator
+            .events
+            .iter()
+            .rev()
+            .take(5)
+            .map(|event| format!("{} · {}", event_label(&event.kind), event.summary))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let left_id_for_click = self.left_worktree;
         let right_id_for_click = self.right_worktree;
@@ -110,6 +279,30 @@ impl Render for WorkspaceView {
         };
         let selected_left = self.selected_recipient == left_session_id;
         let selected_right = self.selected_recipient == right_session_id;
+        let left_attention = left_session_id.is_some_and(|session_id| {
+            self.coordinator
+                .approvals
+                .iter()
+                .any(|approval| approval.session_id == session_id && approval.approved.is_none())
+        }) || self.coordinator.conflicts.iter().any(|conflict| {
+            self.coordinator.events.iter().any(|event| {
+                event.id == conflict.left_event_id
+                    && event.worktree_id == self.left_worktree
+                    && conflict.blocked
+            })
+        });
+        let right_attention = right_session_id.is_some_and(|session_id| {
+            self.coordinator
+                .approvals
+                .iter()
+                .any(|approval| approval.session_id == session_id && approval.approved.is_none())
+        }) || self.coordinator.conflicts.iter().any(|conflict| {
+            self.coordinator.events.iter().any(|event| {
+                event.id == conflict.left_event_id
+                    && event.worktree_id == self.right_worktree
+                    && conflict.blocked
+            })
+        });
         let connection_action_label = format!(
             "Link as {} · {}",
             format_connection_type(&self.connection_kind),
@@ -168,16 +361,19 @@ impl Render for WorkspaceView {
                     .child(
                         div()
                             .id(SharedString::from("worktree-left"))
-                            .child(worktree_card(
-                                &left.name,
-                                left_session
+                            .child(worktree_card(WorktreeCardData {
+                                name: &left.name,
+                                agent: left_session
                                     .map(|session| session.agent_name.as_str())
                                     .unwrap_or("no agent"),
-                                left_context.events.len(),
-                                selected_left,
-                                left_task_count,
-                                left_artifact_count,
-                            ))
+                                status: &left_status,
+                                context_count: right_context.events.len(),
+                                selected: selected_left,
+                                attention: left_attention,
+                                task_count: left_task_count,
+                                artifact_count: left_artifact_count,
+                                next_action: left_next_action,
+                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_recipient = left_session_id_for_click;
                                 cx.notify();
@@ -210,16 +406,19 @@ impl Render for WorkspaceView {
                     .child(
                         div()
                             .id(SharedString::from("worktree-right"))
-                            .child(worktree_card(
-                                &right.name,
-                                right_session
+                            .child(worktree_card(WorktreeCardData {
+                                name: &right.name,
+                                agent: right_session
                                     .map(|session| session.agent_name.as_str())
                                     .unwrap_or("no agent"),
-                                right_context.events.len(),
-                                selected_right,
-                                right_task_count,
-                                right_artifact_count,
-                            ))
+                                status: &right_status,
+                                context_count: left_context.events.len(),
+                                selected: selected_right,
+                                attention: right_attention,
+                                task_count: right_task_count,
+                                artifact_count: right_artifact_count,
+                                next_action: right_next_action,
+                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_recipient = right_session_id_for_click;
                                 cx.notify();
@@ -255,25 +454,56 @@ impl Render for WorkspaceView {
                     .gap_4()
                     .child(info_panel(
                         "Shared context",
-                        if left_context.summary.is_empty() {
+                        if right_context.summary.is_empty() {
                             "No shared events yet."
                         } else {
-                            &left_context.summary
+                            &right_context.summary
                         },
                     ))
-                    .child(info_panel(
-                        "Attention",
-                        &format!(
-                            "{} item(s) need your attention: {} approval(s), {} blocked conflict(s).",
-                            attention_count,
-                            pending_approvals,
-                            self.coordinator
-                                .conflicts
-                                .iter()
-                                .filter(|conflict| conflict.blocked)
-                                .count()
-                        ),
-                    )),
+                    .child(
+                        div()
+                            .flex_1()
+                            .rounded_lg()
+                            .bg(rgb(0x151923))
+                            .border_1()
+                            .border_color(rgb(if attention_count > 0 {
+                                0xfcd34d
+                            } else {
+                                0x252b38
+                            }))
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("Attention"),
+                            )
+                            .child(div().text_xs().text_color(rgb(0x8d96a8)).child(format!(
+                                "{} item(s): {} approval(s), {} blocked, {} low-risk conflict(s).",
+                                attention_count,
+                                pending_approvals,
+                                blocked_conflicts,
+                                low_risk_conflicts
+                            )))
+                            .child(
+                                action_button(if pending_approval_id.is_some() {
+                                    "Approve next action"
+                                } else {
+                                    "No pending approval"
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if let Some(approval_id) = pending_approval_id {
+                                            this.coordinator.approve(approval_id, true);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -306,66 +536,109 @@ impl Render for WorkspaceView {
                                 div()
                                     .flex()
                                     .gap_2()
+                                    .child(action_button("Select API agent").on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.selected_recipient = left_session_id;
+                                            cx.notify();
+                                        },
+                                    )))
+                                    .child(action_button("Select web agent").on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.selected_recipient = right_session_id;
+                                            cx.notify();
+                                        },
+                                    )))
                                     .child(
-                                        action_button("Select API agent")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.selected_recipient = left_session_id;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        action_button("Select web agent")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.selected_recipient = right_session_id;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        action_button("Send context ping")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let Some(session_id) = this.selected_recipient {
-                                                    let summary = this
-                                                        .coordinator
-                                                        .context_for(this.right_worktree)
-                                                        .summary;
-                                                    this.coordinator.send_message(
-                                                        session_id,
-                                                        if summary.is_empty() {
-                                                            "Please report your current status."
-                                                        } else {
-                                                            "Please use the latest connected context and report your next action."
-                                                        },
-                                                    );
-                                                }
-                                                cx.notify();
-                                            })))
-                                    .child(
-                                        action_button(connection_action_label).on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.connection_kind = next_connection_type(
-                                                    &this.connection_kind,
-                                                );
-                                                cx.notify();
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        action_button("Toggle temporary link").on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.connection_lifetime =
-                                                    match this.connection_lifetime {
-                                                        ConnectionLifetime::Persistent => {
-                                                            ConnectionLifetime::Temporary
+                                        div()
+                                            .flex_1()
+                                            .rounded_sm()
+                                            .bg(rgb(0x202735))
+                                            .p_2()
+                                            .track_focus(&self.focus_handle)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, window, _| {
+                                                    window.focus(&this.focus_handle);
+                                                }),
+                                            )
+                                            .on_key_down(cx.listener(
+                                                |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                    match event.keystroke.key.as_str() {
+                                                        "enter" => this.send_composer_message(),
+                                                        "backspace" => {
+                                                            this.composer.pop();
                                                         }
-                                                        ConnectionLifetime::Temporary => {
-                                                            ConnectionLifetime::Persistent
+                                                        _ if !event.keystroke.modifiers.control
+                                                            && !event.keystroke.modifiers.alt
+                                                            && !event
+                                                                .keystroke
+                                                                .modifiers
+                                                                .platform =>
+                                                        {
+                                                            if let Some(character) =
+                                                                event.keystroke.key_char.as_ref()
+                                                            {
+                                                                this.composer.push_str(character);
+                                                            }
                                                         }
-                                                    };
-                                                cx.notify();
+                                                        _ => {}
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(if self.composer.is_empty() {
+                                                "Type a message, then press Enter…".to_string()
+                                            } else {
+                                                self.composer.clone()
                                             }),
-                                        ),
-                                    ),
-                            ),
+                                    )
+                                    .child(action_button("Send message").on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.send_composer_message();
+                                            cx.notify();
+                                        },
+                                    )))
+                                    .child(action_button(connection_action_label).on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.connection_kind =
+                                                next_connection_type(&this.connection_kind);
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(action_button("Toggle temporary link").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.connection_lifetime =
+                                                match this.connection_lifetime {
+                                                    ConnectionLifetime::Persistent => {
+                                                        ConnectionLifetime::Temporary
+                                                    }
+                                                    ConnectionLifetime::Temporary => {
+                                                        ConnectionLifetime::Persistent
+                                                    }
+                                                };
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(action_button(left_lifecycle_label).on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_session(this.left_worktree);
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(action_button(right_lifecycle_label).on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_session(this.right_worktree);
+                                            cx.notify();
+                                        }),
+                                    )),
+                            )
+                            .child(div().text_xs().text_color(rgb(0x77829a)).child(
+                                if chat_history.is_empty() {
+                                    "No messages sent yet.".to_string()
+                                } else {
+                                    format!("Recent messages:\n{}", chat_history)
+                                },
+                            )),
                     )
                     .child(
                         div()
@@ -384,25 +657,22 @@ impl Render for WorkspaceView {
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .child("Evidence"),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x9aa5b8))
-                                    .child(if self.show_raw {
-                                        raw_output
-                                    } else {
-                                        "Summaries stay short. Expand to inspect raw agent output."
-                                            .to_string()
-                                    }),
-                            )
-                            .child(
-                                action_button(raw_button_label).on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.show_raw = !this.show_raw;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
+                            .child(div().text_xs().text_color(rgb(0x9aa5b8)).child(
+                                if self.show_raw {
+                                    format!("{}\n\nArtifacts:\n{}", raw_output, artifact_summary)
+                                } else {
+                                    format!(
+                                        "Summary: {}\n\nTimeline:\n{}",
+                                        output_summary, timeline_summary
+                                    )
+                                },
+                            ))
+                            .child(action_button(raw_button_label).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.show_raw = !this.show_raw;
+                                    cx.notify();
+                                },
+                            ))),
                     ),
             )
     }
@@ -419,19 +689,18 @@ fn status_pill(label: &str, color: u32) -> impl IntoElement {
         .child(label.to_string())
 }
 
-fn worktree_card(
-    name: &str,
-    agent: &str,
-    context_count: usize,
-    selected: bool,
-    task_count: usize,
-    artifact_count: usize,
-) -> impl IntoElement {
+fn worktree_card(data: WorktreeCardData<'_>) -> impl IntoElement {
     div()
         .w(px(260.))
         .rounded_lg()
         .border_1()
-        .border_color(rgb(if selected { 0x6ee7b7 } else { 0x34405a }))
+        .border_color(rgb(if data.attention {
+            0xfcd34d
+        } else if data.selected {
+            0x6ee7b7
+        } else {
+            0x34405a
+        }))
         .bg(rgb(0x1b2130))
         .p_4()
         .flex()
@@ -441,24 +710,30 @@ fn worktree_card(
             div()
                 .text_lg()
                 .font_weight(gpui::FontWeight::BOLD)
-                .child(name.to_string()),
+                .child(data.name.to_string()),
         )
         .child(
             div()
                 .text_sm()
                 .text_color(rgb(0x9aa5b8))
-                .child(format!("{} · running", agent)),
+                .child(format!("{} · {}", data.agent, data.status)),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(rgb(0x6ee7b7))
-                .child(format!("{} shared events", context_count)),
+                .child(format!("{} shared events", data.context_count)),
         )
         .child(div().text_xs().text_color(rgb(0x9aa5b8)).child(format!(
             "{} task(s) · {} artifact(s)",
-            task_count, artifact_count
+            data.task_count, data.artifact_count
         )))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0xfcd34d))
+                .child(format!("Next: {}", data.next_action)),
+        )
 }
 
 fn connection_marker(kind: &str) -> impl IntoElement {
@@ -496,6 +771,22 @@ fn format_connection_type(kind: &ConnectionType) -> String {
         ConnectionType::Information => "information".to_string(),
         ConnectionType::Review => "review".to_string(),
         ConnectionType::Blocking => "blocking".to_string(),
+    }
+}
+
+fn format_session_status(status: &milagre::SessionStatus) -> String {
+    match status {
+        milagre::SessionStatus::Created => "created".to_string(),
+        milagre::SessionStatus::Running => "running".to_string(),
+        milagre::SessionStatus::Stopped => "stopped".to_string(),
+    }
+}
+
+fn event_label(kind: &milagre::EventKind) -> &'static str {
+    match kind {
+        milagre::EventKind::Decision => "decision",
+        milagre::EventKind::Change => "change",
+        milagre::EventKind::Blocker => "blocker",
     }
 }
 
@@ -538,7 +829,7 @@ fn info_panel(title: &str, body: &str) -> impl IntoElement {
         )
 }
 
-fn main() {
+fn seed_workspace() -> (Coordinator, u64, u64) {
     let mut coordinator = Coordinator::new();
     let project = coordinator.add_project("Milagre");
     let left = coordinator.add_worktree(project, "api", "./worktrees/api");
@@ -571,6 +862,11 @@ fn main() {
         "Waiting for the API contract.",
         "agent-b: ready to consume the shared API contract.",
     );
+    let _ = coordinator.authorize_operation(
+        left_session,
+        milagre::OperationKind::Publication,
+        "Publish the API package",
+    );
     coordinator.connect(
         left,
         right,
@@ -583,6 +879,36 @@ fn main() {
         "Shared API contract",
         "The web agent can consume the API contract.",
     );
+    coordinator.publish(
+        left,
+        EventKind::Change,
+        "API contract file updated",
+        "The shared contract is available for client verification.",
+    );
+    coordinator.publish(
+        right,
+        EventKind::Blocker,
+        "Waiting for client verification",
+        "The client agent needs the API contract before finishing.",
+    );
+
+    (coordinator, left, right)
+}
+
+fn load_workspace() -> (Coordinator, u64, u64) {
+    let state_path = Path::new(".milagre/coordination.json");
+    if let Ok(coordinator) = Coordinator::load(state_path) {
+        let mut worktree_ids = coordinator.worktrees.keys().copied().collect::<Vec<_>>();
+        worktree_ids.sort_unstable();
+        if worktree_ids.len() >= 2 {
+            return (coordinator, worktree_ids[0], worktree_ids[1]);
+        }
+    }
+    seed_workspace()
+}
+
+fn main() {
+    let (coordinator, left, right) = load_workspace();
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1040.), px(720.)), cx);
@@ -592,6 +918,7 @@ fn main() {
                 ..Default::default()
             },
             |_, cx| {
+                let focus_handle = cx.focus_handle();
                 cx.new(|_| WorkspaceView {
                     coordinator,
                     left_worktree: left,
@@ -601,6 +928,8 @@ fn main() {
                     drag_origin: None,
                     connection_kind: ConnectionType::Information,
                     connection_lifetime: ConnectionLifetime::Persistent,
+                    composer: String::new(),
+                    focus_handle,
                 })
             },
         )
