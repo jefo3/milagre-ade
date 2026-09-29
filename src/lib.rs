@@ -311,6 +311,36 @@ impl Coordinator {
             })
             .collect()
     }
+
+    pub fn export_snapshot(&self) -> String {
+        let mut output = String::from("# Milagre coordination snapshot\n\n");
+        for project in self.projects.values() {
+            output.push_str(&format!("project|{}|{}\n", project.id, project.name));
+        }
+        for worktree in self.worktrees.values() {
+            output.push_str(&format!(
+                "worktree|{}|{}|{}|{}\n",
+                worktree.id, worktree.project_id, worktree.name, worktree.path
+            ));
+        }
+        for connection in self.connections.values() {
+            output.push_str(&format!(
+                "connection|{}|{}|{}|{:?}|{:?}\n",
+                connection.id,
+                connection.left_worktree_id,
+                connection.right_worktree_id,
+                connection.kind,
+                connection.lifetime
+            ));
+        }
+        for event in &self.events {
+            output.push_str(&format!(
+                "event|{}|{}|{:?}|{}|{}\n",
+                event.id, event.worktree_id, event.kind, event.summary, event.details
+            ));
+        }
+        output
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +417,30 @@ mod tests {
         assert_eq!(coordinator.approvals[0].approved, None);
         coordinator.approve(approval, true);
         assert_eq!(coordinator.approvals[0].approved, Some(true));
+    }
+
+    #[test]
+    fn coordination_can_be_exported_for_recovery() {
+        let mut coordinator = Coordinator::new();
+        let project = coordinator.add_project("ADE demo");
+        let first = coordinator.add_worktree(project, "api", "/tmp/api");
+        let second = coordinator.add_worktree(project, "web", "/tmp/web");
+        coordinator.connect(
+            first,
+            second,
+            ConnectionType::Dependency,
+            ConnectionLifetime::Persistent,
+        );
+        coordinator.publish(
+            first,
+            EventKind::Decision,
+            "Contract first",
+            "Share the API contract before UI changes.",
+        );
+
+        let snapshot = coordinator.export_snapshot();
+        assert!(snapshot.contains("project|"));
+        assert!(snapshot.contains("connection|"));
+        assert!(snapshot.contains("Contract first"));
     }
 }
