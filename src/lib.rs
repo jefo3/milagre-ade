@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
@@ -20,6 +20,32 @@ pub struct Worktree {
     pub project_id: Id,
     pub path: String,
     pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    pub id: Id,
+    pub worktree_id: Id,
+    pub title: String,
+    pub status: TaskStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskStatus {
+    Open,
+    Active,
+    Blocked,
+    Done,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub id: Id,
+    pub worktree_id: Id,
+    pub kind: String,
+    pub label: String,
+    pub path: String,
+    pub content: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +155,8 @@ pub struct Coordinator {
     next_id: Id,
     pub projects: HashMap<Id, Project>,
     pub worktrees: HashMap<Id, Worktree>,
+    pub tasks: HashMap<Id, Task>,
+    pub artifacts: HashMap<Id, Artifact>,
     pub sessions: HashMap<Id, AgentSession>,
     pub connections: HashMap<Id, Connection>,
     pub events: Vec<Event>,
@@ -183,6 +211,56 @@ impl Coordinator {
                 project_id,
                 name: name.into(),
                 path: path.into(),
+            },
+        );
+        id
+    }
+
+    pub fn add_task(
+        &mut self,
+        worktree_id: Id,
+        title: impl Into<String>,
+        status: TaskStatus,
+    ) -> Id {
+        assert!(
+            self.worktrees.contains_key(&worktree_id),
+            "worktree must exist"
+        );
+        let id = self.id();
+        self.tasks.insert(
+            id,
+            Task {
+                id,
+                worktree_id,
+                title: title.into(),
+                status,
+            },
+        );
+        id
+    }
+
+    pub fn add_artifact(
+        &mut self,
+        worktree_id: Id,
+        kind: impl Into<String>,
+        label: impl Into<String>,
+        path: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Id {
+        assert!(
+            self.worktrees.contains_key(&worktree_id),
+            "worktree must exist"
+        );
+        let id = self.id();
+        self.artifacts.insert(
+            id,
+            Artifact {
+                id,
+                worktree_id,
+                kind: kind.into(),
+                label: label.into(),
+                path: path.into(),
+                content: content.into(),
             },
         );
         id
@@ -371,6 +449,18 @@ impl Coordinator {
             .find(|output| output.session_id == session_id)
     }
 
+    pub fn write_context_file(&self, worktree_id: Id) -> io::Result<std::path::PathBuf> {
+        let worktree = self
+            .worktrees
+            .get(&worktree_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "worktree does not exist"))?;
+        let directory = Path::new(&worktree.path).join(".milagre");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("context.md");
+        fs::write(&path, self.context_for(worktree_id).persistent_context)?;
+        Ok(path)
+    }
+
     pub fn send_message(&mut self, session_id: Id, body: impl Into<String>) -> Id {
         assert!(
             self.sessions.contains_key(&session_id),
@@ -483,6 +573,8 @@ impl Coordinator {
             next_id: snapshot.next_id,
             projects: snapshot.projects,
             worktrees: snapshot.worktrees,
+            tasks: snapshot.tasks,
+            artifacts: snapshot.artifacts,
             sessions: snapshot.sessions,
             connections: snapshot.connections,
             events: snapshot.events,
@@ -526,6 +618,8 @@ impl Coordinator {
             .projects
             .keys()
             .chain(self.worktrees.keys())
+            .chain(self.tasks.keys())
+            .chain(self.artifacts.keys())
             .chain(self.sessions.keys())
             .chain(self.connections.keys())
             .chain(self.events.iter().map(|event| &event.id))
@@ -545,6 +639,8 @@ struct PersistedCoordinator {
     next_id: Id,
     projects: HashMap<Id, Project>,
     worktrees: HashMap<Id, Worktree>,
+    tasks: HashMap<Id, Task>,
+    artifacts: HashMap<Id, Artifact>,
     sessions: HashMap<Id, AgentSession>,
     connections: HashMap<Id, Connection>,
     events: Vec<Event>,
@@ -560,6 +656,8 @@ impl From<&Coordinator> for PersistedCoordinator {
             next_id: coordinator.next_id,
             projects: coordinator.projects.clone(),
             worktrees: coordinator.worktrees.clone(),
+            tasks: coordinator.tasks.clone(),
+            artifacts: coordinator.artifacts.clone(),
             sessions: coordinator.sessions.clone(),
             connections: coordinator.connections.clone(),
             events: coordinator.events.clone(),
@@ -589,6 +687,8 @@ mod tests {
         let project = coordinator.add_project("ADE demo");
         let first = coordinator.add_worktree(project, "api", "/tmp/api");
         let second = coordinator.add_worktree(project, "web", "/tmp/web");
+        coordinator.add_task(first, "Define contract", TaskStatus::Active);
+        coordinator.add_artifact(first, "diff", "Contract diff", "src/api.rs", "+ contract");
         coordinator.start_session(first, "fake-agent-a");
         coordinator.start_session(second, "fake-agent-b");
         coordinator.connect(
@@ -700,6 +800,8 @@ mod tests {
         std::fs::remove_file(&path).expect("test snapshot should be removed");
 
         assert_eq!(restored.projects, coordinator.projects);
+        assert_eq!(restored.tasks, coordinator.tasks);
+        assert_eq!(restored.artifacts, coordinator.artifacts);
         assert_eq!(restored.context_for(second).events.len(), 1);
         assert_eq!(
             restored.context_for(second).events[0].summary,
@@ -778,5 +880,29 @@ mod tests {
             .expect("output exists");
         assert_eq!(output.summary, "Updated the API contract.");
         assert_eq!(output.raw, "full terminal output");
+    }
+
+    #[test]
+    fn connected_context_can_be_written_to_a_worktree_file() {
+        let root = std::env::temp_dir().join(format!("milagre-context-{}", std::process::id()));
+        let mut coordinator = Coordinator::new();
+        let project = coordinator.add_project("ADE demo");
+        let first = coordinator.add_worktree(project, "api", root.join("api").to_string_lossy());
+        let second = coordinator.add_worktree(project, "web", root.join("web").to_string_lossy());
+        coordinator.connect(
+            first,
+            second,
+            ConnectionType::Information,
+            ConnectionLifetime::Persistent,
+        );
+        coordinator.publish(first, EventKind::Decision, "Contract first", "Use v1.");
+
+        let context_path = coordinator
+            .write_context_file(second)
+            .expect("context file should be written");
+        let contents =
+            std::fs::read_to_string(context_path).expect("context file should be readable");
+        assert!(contents.contains("Contract first"));
+        std::fs::remove_dir_all(root).expect("test context directory should be removed");
     }
 }

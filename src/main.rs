@@ -30,6 +30,30 @@ impl Render for WorkspaceView {
             .expect("right worktree");
         let left_context = self.coordinator.context_for(self.left_worktree);
         let right_context = self.coordinator.context_for(self.right_worktree);
+        let left_task_count = self
+            .coordinator
+            .tasks
+            .values()
+            .filter(|task| task.worktree_id == self.left_worktree)
+            .count();
+        let right_task_count = self
+            .coordinator
+            .tasks
+            .values()
+            .filter(|task| task.worktree_id == self.right_worktree)
+            .count();
+        let left_artifact_count = self
+            .coordinator
+            .artifacts
+            .values()
+            .filter(|artifact| artifact.worktree_id == self.left_worktree)
+            .count();
+        let right_artifact_count = self
+            .coordinator
+            .artifacts
+            .values()
+            .filter(|artifact| artifact.worktree_id == self.right_worktree)
+            .count();
         let left_session = self
             .coordinator
             .sessions
@@ -151,6 +175,8 @@ impl Render for WorkspaceView {
                                     .unwrap_or("no agent"),
                                 left_context.events.len(),
                                 selected_left,
+                                left_task_count,
+                                left_artifact_count,
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_recipient = left_session_id_for_click;
@@ -191,6 +217,8 @@ impl Render for WorkspaceView {
                                     .unwrap_or("no agent"),
                                 right_context.events.len(),
                                 selected_right,
+                                right_task_count,
+                                right_artifact_count,
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_recipient = right_session_id_for_click;
@@ -396,6 +424,8 @@ fn worktree_card(
     agent: &str,
     context_count: usize,
     selected: bool,
+    task_count: usize,
+    artifact_count: usize,
 ) -> impl IntoElement {
     div()
         .w(px(260.))
@@ -425,6 +455,10 @@ fn worktree_card(
                 .text_color(rgb(0x6ee7b7))
                 .child(format!("{} shared events", context_count)),
         )
+        .child(div().text_xs().text_color(rgb(0x9aa5b8)).child(format!(
+            "{} task(s) · {} artifact(s)",
+            task_count, artifact_count
+        )))
 }
 
 fn connection_marker(kind: &str) -> impl IntoElement {
@@ -509,8 +543,34 @@ fn main() {
     let project = coordinator.add_project("Milagre");
     let left = coordinator.add_worktree(project, "api", "./worktrees/api");
     let right = coordinator.add_worktree(project, "web", "./worktrees/web");
-    coordinator.start_session(left, "agent-a");
-    coordinator.start_session(right, "agent-b");
+    let left_session = coordinator.start_session(left, "agent-a");
+    let right_session = coordinator.start_session(right, "agent-b");
+    coordinator.add_task(left, "Align API contract", milagre::TaskStatus::Active);
+    coordinator.add_task(right, "Consume API contract", milagre::TaskStatus::Open);
+    coordinator.add_artifact(
+        left,
+        "diff",
+        "API contract diff",
+        "src/api.rs",
+        "+ pub fn shared_contract()\n",
+    );
+    coordinator.add_artifact(
+        right,
+        "diff",
+        "Client update diff",
+        "src/client.rs",
+        "+ use shared_contract;\n",
+    );
+    coordinator.record_output(
+        left_session,
+        "Updated the shared API contract.",
+        "agent-a: updated src/api.rs and is waiting for client verification.",
+    );
+    coordinator.record_output(
+        right_session,
+        "Waiting for the API contract.",
+        "agent-b: ready to consume the shared API contract.",
+    );
     coordinator.connect(
         left,
         right,

@@ -1,8 +1,11 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+
+use crate::{Coordinator, Id};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentCommand {
@@ -132,6 +135,74 @@ impl AgentPty {
     }
 }
 
+#[derive(Default)]
+pub struct AgentRuntime {
+    sessions: HashMap<Id, AgentPty>,
+}
+
+impl AgentRuntime {
+    pub fn start(
+        &mut self,
+        coordinator: &mut Coordinator,
+        session_id: Id,
+        command: AgentCommand,
+    ) -> Result<(), anyhow::Error> {
+        assert!(
+            coordinator.sessions.contains_key(&session_id),
+            "session must exist"
+        );
+        let pty = AgentPty::spawn(command)?;
+        self.sessions.insert(session_id, pty);
+        Ok(())
+    }
+
+    pub fn send(&mut self, session_id: Id, input: &str) -> io::Result<()> {
+        self.sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "agent is not running"))?
+            .send(input)
+    }
+
+    pub fn poll_output(
+        &mut self,
+        coordinator: &mut Coordinator,
+        session_id: Id,
+    ) -> io::Result<String> {
+        let output = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "agent is not running"))?
+            .try_read()?;
+        if !output.is_empty() {
+            coordinator.record_output(session_id, summarize_output(&output), &output);
+        }
+        Ok(output)
+    }
+
+    pub fn stop(&mut self, coordinator: &mut Coordinator, session_id: Id) -> io::Result<()> {
+        let mut pty = self
+            .sessions
+            .remove(&session_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "agent is not running"))?;
+        pty.kill()?;
+        if let Some(session) = coordinator.sessions.get_mut(&session_id) {
+            session.status = crate::SessionStatus::Stopped;
+        }
+        Ok(())
+    }
+}
+
+fn summarize_output(output: &str) -> String {
+    output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Agent produced output.")
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +227,42 @@ mod tests {
 
         let output = session.wait().expect("PTY process should finish");
         assert!(output.contains("milagre-agent-output"));
+    }
+
+    #[test]
+    fn runtime_routes_pty_output_into_coordinator_evidence() {
+        let mut coordinator = Coordinator::new();
+        let project = coordinator.add_project("ADE demo");
+        let worktree = coordinator.add_worktree(project, "api", "/tmp/api");
+        let session = coordinator.start_session(worktree, "fake-agent");
+        let mut runtime = AgentRuntime::default();
+        runtime
+            .start(
+                &mut coordinator,
+                session,
+                AgentCommand::new("/bin/sh")
+                    .arg("-c")
+                    .arg("printf 'runtime-output'"),
+            )
+            .expect("runtime should start");
+
+        for _ in 0..20 {
+            let output = runtime
+                .poll_output(&mut coordinator, session)
+                .expect("runtime should poll");
+            if output.contains("runtime-output") {
+                let evidence = coordinator
+                    .latest_output_for(session)
+                    .expect("output should be recorded");
+                assert_eq!(evidence.raw, "runtime-output");
+                runtime
+                    .stop(&mut coordinator, session)
+                    .expect("stop should work");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        panic!("runtime did not produce output");
     }
 }
