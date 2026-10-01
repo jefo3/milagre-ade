@@ -19,7 +19,11 @@ export interface ModelOption {
 }
 
 export const MODEL_CATALOG: ModelOption[] = [
-  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", provider: "codex", description: "Frontier model for complex reasoning and coding", recommended: true },
+  { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "codex", description: "Latest workhorse model for coding and everyday work", recommended: true },
+  { id: "gpt-6-astra", name: "GPT-6 Astra", provider: "codex", description: "Frontier intelligence for the most demanding work" },
+  { id: "gpt-6-sol", name: "GPT-6 Sol", provider: "codex", description: "Previous generation workhorse model" },
+  { id: "gpt-6-luna", name: "GPT-6 Luna", provider: "codex", description: "Fast and affordable model for easier tasks" },
+  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", provider: "codex", description: "Older generation workhorse model" },
   { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", provider: "codex", description: "Balanced intelligence and cost" },
   { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", provider: "codex", description: "Fast, cost-sensitive model" },
   { id: "gpt-5.1-codex", name: "GPT-5.1 Codex", provider: "codex", description: "Optimized for agentic coding" },
