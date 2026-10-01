@@ -60,7 +60,7 @@ The UI will summarize agent output into concise, humanized text by default, whil
 ## Implementation Decisions
 
 - The product is a private, local-first macOS desktop application.
-- The initial UI technology will be GPUI in Rust, chosen for a native, GPU-accelerated and highly customizable canvas experience. GPUI is pre-1.0, so the application should isolate UI-specific code from domain and orchestration code.
+- The initial UI technology is React with Electron, chosen for a web-friendly desktop interface and fast visual iteration. The renderer remains isolated from the Electron process boundary so the orchestration and filesystem capabilities stay local and explicit.
 - The architecture will separate the desktop UI from the orchestration runtime. The UI renders projections and sends commands; the runtime owns agent processes, worktrees, events, persistence and context assembly.
 - The core domain model will include Project, Worktree, AgentSession, Task, Canvas, Connection, Event, Decision, Blocker and Artifact.
 - A Worktree is an isolated git working environment. An AgentSession belongs to one Worktree and represents one running or historical CLI agent process.
@@ -73,7 +73,7 @@ The UI will summarize agent output into concise, humanized text by default, whil
 - Agents may emit free-form messages, but the runtime must preserve the distinction between messages, decisions, events and artifacts.
 - Context assembly is relationship-aware. Connected worktrees receive relevant goals, decisions, blockers and changes rather than the complete history by default.
 - Context is exposed through three mechanisms: a concise injected summary, a persistent context file in the worktree, and a detailed query/tool path for capable agents.
-- The first agent integration uses PTY-based process control as a universal fallback. Provider-specific adapters are optional extensions and must not be required by the domain model.
+- The first agent integration uses local CLI processes through Electron's main process. PTY-based process control and provider-specific adapters remain future extensions and must not leak provider details into the renderer domain model.
 - The global chat requires an explicit recipient. A future coordinator agent may suggest routing, but the MVP must not silently route important instructions.
 - Deterministic extraction handles factual state and event creation. An LLM may generate concise summaries and humanized copy, but it is not authoritative for state.
 - The default UI output is concise and human-readable. The complete raw output remains accessible through expandable or tabbed views for summary, events, terminal and diff.
@@ -81,14 +81,14 @@ The UI will summarize agent output into concise, humanized text by default, whil
 - Conflict handling is risk-sensitive: low-risk conflicts are surfaced, while high-risk conflicts can block propagation or execution.
 - Coordination state is persisted in a local database or equivalent structured store and can be exported to versionable project files. The persistence abstraction must not hard-code a future cloud provider.
 - The MVP excludes a built-in code editor. Files and diffs may be viewed, while editing remains the responsibility of the agent and the user's existing editor.
-- The first vertical slice must support two simulated or real worktrees, two agent sessions, one canvas connection, one published decision and verified context delivery to the other agent.
+- The first vertical slice must support two simulated or real worktrees, two agent sessions, one connected-worktree view, one published decision and verified context delivery to the other agent.
 
 ## Testing Decisions
 
 - The primary test seam is one end-to-end vertical-slice behavior test at the orchestration boundary.
 - The behavior test creates two simulated worktrees, starts two fake agent sessions, connects the worktrees, publishes a decision in one worktree and verifies that the other receives the relevant context.
 - Fake agents are used for deterministic tests. Real PTY and provider adapters are tested separately at their highest practical integration seam.
-- Tests assert external behavior: commands, persisted state, emitted events, context received by the second agent and visible projections. They should not assert private implementation details or GPUI widget internals.
+- Tests assert external behavior: commands, persisted state, emitted events, context received by the second agent and visible projections. They should not assert private implementation details or renderer component internals.
 - The orchestration boundary test must cover connection creation, bidirectional context visibility, event persistence, decision propagation and recipient selection.
 - Persistence tests must verify that persistent and temporary connections survive or expire according to their declared lifecycle.
 - Context assembly tests must verify relevance filtering and the presence of concise summaries, persistent context and detailed retrieval.
@@ -110,10 +110,10 @@ The UI will summarize agent output into concise, humanized text by default, whil
 - A complete project-management or issue-tracking replacement.
 - A polished multi-agent workflow engine beyond the first context-sharing vertical slice.
 - Cross-platform packaging before the macOS experience is validated.
-- Open-source release, community workflows and public plugin APIs.
+- Public plugin APIs and a complete community extension system.
 
 ## Further Notes
 
 - Existing ADEs suggest a useful separation between a desktop client and a local daemon that manages agent processes, workspaces and real-time events. Paseo documents this as a client-server system with a local daemon and WebSocket event streaming; Orca similarly treats sessions, PTYs, worktrees and a cross-session board as separate concepts. The proposed architecture adopts those boundaries while making the worktree relationship graph and canvas the primary differentiator.
-- The project should preserve a clean boundary between domain state, process control and GPUI rendering. This keeps the system testable and leaves room to replace GPUI if its pre-1.0 API or web-adjacent requirements become a problem.
+- The project should preserve a clean boundary between domain state, process control and React rendering. This keeps the system testable and leaves room to replace the renderer without changing orchestration behavior.
 - The first implementation milestone should be a non-polished vertical slice, not a broad shell of every planned view. It should prove that a decision made in one worktree can become useful context in another and that the user can understand the relationship visually.

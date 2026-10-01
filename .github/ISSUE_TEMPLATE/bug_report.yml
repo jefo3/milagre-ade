@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible problem in Milagre.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove secrets, tokens and private project paths before submitting.
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include relevant errors or screenshots.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest set of steps that reproduces the issue.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Milagre version or commit
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version

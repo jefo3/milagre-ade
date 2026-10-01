@@ -1,0 +1,162 @@
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { type ReactNode, useId, useState } from "react";
+import { EASE_OUT, SPRING_LAYOUT } from "../../lib/ease";
+
+export interface PreviewRailItem {
+  id: string;
+  label: string;
+  ariaLabel?: string;
+  description?: ReactNode;
+}
+
+interface PreviewRailProps {
+  items: PreviewRailItem[];
+  label?: string;
+  activeId?: string;
+  onActiveChange?: (id: string) => void;
+  onItemSelect?: (item: PreviewRailItem) => void;
+  renderPreview?: (item: PreviewRailItem) => ReactNode;
+  showPreview?: boolean;
+  previewSide?: "before" | "after";
+  highlightActive?: boolean;
+  itemSize?: number;
+  children?: ReactNode;
+  className?: string;
+  railClassName?: string;
+  previewContainerClassName?: string;
+  previewClassName?: string;
+}
+
+function DefaultPreview({ item }: { item: PreviewRailItem }) {
+  return (
+    <div data-slot="preview-rail-card" className="rounded-xl border border-line bg-surface p-3 shadow-raised">
+      <p data-slot="preview-rail-title" className="font-medium text-ink">
+        {item.label}
+      </p>
+      {item.description ? (
+        <div data-slot="preview-rail-description" className="mt-1 text-sm leading-5 text-ink-2">
+          {item.description}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function PreviewRail({
+  items,
+  label = "Section navigation",
+  activeId,
+  onActiveChange,
+  onItemSelect,
+  renderPreview,
+  showPreview = true,
+  previewSide = "after",
+  highlightActive = false,
+  itemSize = 24,
+  children,
+  className = "",
+  railClassName = "",
+  previewContainerClassName = "",
+  previewClassName = "",
+}: PreviewRailProps) {
+  const uid = useId();
+  const reduce = useReducedMotion() ?? false;
+  const [internalActiveId, setInternalActiveId] = useState(items[0]?.id ?? "");
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [pinnedId, setPinnedId] = useState<string | null>(null);
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const selectedId = activeId ?? internalActiveId;
+  const displayedId = hoveredId ?? pinnedId ?? focusedId ?? "";
+  const highlightedId = displayedId || (highlightActive ? selectedId : "");
+  const displayedIndex = items.findIndex((item) => item.id === highlightedId);
+  const rowTemplate = items.length ? `repeat(${items.length}, ${itemSize}px)` : undefined;
+
+  function selectItem(item: PreviewRailItem) {
+    if (activeId === undefined) setInternalActiveId(item.id);
+    onActiveChange?.(item.id);
+    onItemSelect?.(item);
+  }
+
+  return (
+    <motion.div layoutRoot className={`isolate relative flex w-full overflow-visible ${className}`}>
+      <nav
+        aria-label={label}
+        onPointerLeave={() => setHoveredId(null)}
+        style={{ gridTemplateRows: rowTemplate }}
+        className={`absolute inset-y-0 left-0 z-10 grid w-12 content-center ${railClassName}`}
+      >
+        {items.map((item, index) => {
+          const selected = item.id === selectedId;
+          const highlighted = item.id === highlightedId;
+          const distance = displayedIndex < 0 ? Number.POSITIVE_INFINITY : Math.abs(index - displayedIndex);
+          const scale = highlighted ? 1 : distance === 1 ? 0.68 : distance === 2 ? 0.44 : 0.25;
+
+          return (
+            <button
+              key={item.id}
+              data-slot="preview-rail-item"
+              type="button"
+              aria-label={item.ariaLabel ?? item.label}
+              aria-current={selected ? "location" : undefined}
+              onPointerEnter={(event) => {
+                if (event.pointerType === "mouse") setHoveredId(item.id);
+              }}
+              onPointerDown={(event) => {
+                if (event.pointerType !== "mouse") setPinnedId(item.id);
+              }}
+              onFocus={(event) => {
+                if (event.currentTarget.matches(":focus-visible")) setFocusedId(item.id);
+              }}
+              onBlur={(event) => {
+                if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) setFocusedId(null);
+              }}
+              onClick={() => selectItem(item)}
+              style={{ height: itemSize }}
+              className="relative flex h-6 w-12 items-center justify-end text-ink-3 outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              <motion.span
+                data-slot="preview-rail-tick"
+                aria-hidden="true"
+                animate={{ scaleX: scale }}
+                transition={reduce ? { duration: 0 } : SPRING_LAYOUT}
+                className={`block h-px w-4 origin-right bg-current ${highlighted ? "text-ink" : "text-line-strong"}`}
+              />
+            </button>
+          );
+        })}
+      </nav>
+
+      {showPreview ? (
+        <div
+          aria-hidden="true"
+          style={{ gridTemplateRows: rowTemplate }}
+          className={`pointer-events-none absolute inset-y-0 right-16 left-4 z-50 grid content-center ${previewSide === "after" ? "right-4 left-16" : ""} ${previewContainerClassName}`}
+        >
+          {items.map((item) => (
+            <div key={item.id} style={{ height: itemSize }} className="relative flex items-center">
+              {item.id === displayedId ? (
+                <div className={`w-full max-w-sm ${previewSide === "before" ? "ml-auto" : ""} ${previewClassName}`}>
+                  <motion.div layoutId={`preview-rail-card-${uid}`} transition={reduce ? { duration: 0 } : SPRING_LAYOUT}>
+                    <AnimatePresence mode="wait" initial={false}>
+                      <motion.div
+                        key={item.id}
+                        initial={reduce ? { opacity: 0 } : { opacity: 0, y: 4, filter: "blur(6px)" }}
+                        animate={reduce ? { opacity: 1 } : { opacity: 1, y: 0, filter: "blur(0px)" }}
+                        exit={reduce ? { opacity: 0 } : { opacity: 0, y: -2, filter: "blur(4px)", transition: { duration: 0.12, ease: EASE_OUT } }}
+                        transition={{ duration: reduce ? 0 : 0.18, ease: EASE_OUT }}
+                      >
+                        {renderPreview ? renderPreview(item) : <DefaultPreview item={item} />}
+                      </motion.div>
+                    </AnimatePresence>
+                  </motion.div>
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="min-h-0 min-w-0 flex-1">{children}</div>
+    </motion.div>
+  );
+}
