@@ -874,6 +874,7 @@ function App() {
             draft={draft}
             onDraftChange={setDraft}
             onSend={() => void sendMessage()}
+            onStop={run && selectedSession ? () => void agentRuns.interrupt(chatKey(project.path, selectedSession.id)) : undefined}
             isSending={isSending}
             sendBlocked={preparing}
             streamingText={run?.text}
