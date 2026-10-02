@@ -3,47 +3,23 @@ import type { ComponentProps, KeyboardEvent } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
   Add01Icon,
-  AiBrowserIcon,
   ArrowDown01Icon,
   ArrowUp01Icon,
   Attachment01Icon,
-  AtIcon,
-  Cancel01Icon,
-  CommandIcon,
-  File02Icon,
-  Link01Icon,
-  Mic01Icon,
+  FlashIcon,
   SecurityCheckIcon,
-  Tick02Icon,
 } from "@hugeicons/core-free-icons";
 import type { AgentCliStatus, EffortLevel, ModelCapability, ModelOption, ModelProvider, PermissionMode } from "../model";
-import { effortCopy, PERMISSION_MODES } from "../model";
+import { effortCopy, PERMISSION_MODES, supportsFastMode } from "../model";
+import Tooltip from "./primitives/Tooltip";
 import { cliMessage, cliNotice, cliTabLabel, messageParts } from "../lib/cli-status";
 import type { ImageDraft } from "./usePastedImages";
 import { PickerPanel, PickerRow } from "./primitives/Picker";
 import { ProviderLogo } from "./ProviderLogo";
+import { Attachments } from "./Attachments";
+import { useProjectFiles } from "./useProjectFiles";
+import { promptToken, fileMentionPath, removePromptToken, insertPromptToken } from "../lib/file-mentions";
 import { useSkills } from "./useSkills";
-
-type SpeechRecognitionResultLike = { [index: number]: { transcript: string } };
-type SpeechRecognitionEventLike = Event & { results: { [index: number]: SpeechRecognitionResultLike } };
-type SpeechRecognitionLike = {
-  lang: string;
-  interimResults: boolean;
-  maxAlternatives: number;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-};
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-declare global {
-  interface Window {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  }
-}
 
 type IconData = ComponentProps<typeof HugeiconsIcon>["icon"];
 
@@ -56,10 +32,7 @@ type MenuRow = { key: string; name: string; desc: string; group?: string; source
 type Source = { key: string; name: string; desc: string; icon: IconData };
 
 const SOURCES: Source[] = [
-  { key: "attach", name: "Add files", desc: "Upload from your computer", icon: Attachment01Icon },
-  { key: "context", name: "Project context", desc: "Files, decisions, and shared records", icon: File02Icon },
-  { key: "worktrees", name: "Worktrees", desc: "Coordinate connected worktrees", icon: Link01Icon },
-  { key: "web", name: "Web search", desc: "Search current information", icon: AiBrowserIcon },
+  { key: "attach", name: "Add files", desc: "Choose files from your computer", icon: Attachment01Icon },
 ];
 
 const COMMANDS = [
@@ -69,13 +42,7 @@ const COMMANDS = [
   { key: "review", name: "/review", desc: "Review the current agent output" },
 ];
 
-const FILES = ["project-context.md", "worktree-diff.patch", "agent-output.txt"];
 
-function parseToken(draft: string): { kind: "at" | "slash"; query: string; start: number } | null {
-  const match = /(^|\s)([@/])([\w.:-]*)$/.exec(draft);
-  if (!match) return null;
-  return { kind: match[2] === "@" ? "at" : "slash", query: match[3].toLowerCase(), start: match.index + match[1].length };
-}
 
 interface PromptComposerProps {
   imageDraft: ImageDraft;
@@ -100,6 +67,8 @@ interface PromptComposerProps {
   onEffortChange: (effort: EffortLevel) => void;
   ultracode: boolean;
   onUltracodeChange: (on: boolean) => void;
+  fastMode: boolean;
+  onFastModeChange: (on: boolean) => void;
   permissionMode: PermissionMode;
   onPermissionModeChange: (mode: PermissionMode) => void;
   /** Keep the tall layout (input above the controls) even while the draft is empty. */
@@ -128,7 +97,7 @@ function EffortMeter({ level, total }: { level: number; total: number }) {
   );
 }
 
-export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, onSend, sendBlocked, running = false, lockedProvider, models, cliStatus, onModelPickerOpen, selectedModel, onModelChange, capability, effort, onEffortChange, ultracode, onUltracodeChange, permissionMode, onPermissionModeChange, alwaysExpanded = false }: PromptComposerProps) {
+export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, onSend, sendBlocked, running = false, lockedProvider, models, cliStatus, onModelPickerOpen, selectedModel, onModelChange, capability, effort, onEffortChange, ultracode, onUltracodeChange, fastMode, onFastModeChange, permissionMode, onPermissionModeChange, alwaysExpanded = false }: PromptComposerProps) {
   const [dismissed, setDismissed] = useState(false);
   const [plusOpen, setPlusOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
@@ -140,46 +109,46 @@ export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, 
   // Ultracode (Claude) and Codex's ultra level both hand work to parallel agents: they share the accent.
   const orchestrating = ultracode || effort === "ultra";
   const effortLabel = ultracode ? "Ultracode" : effortName;
+  const canUseFastMode = supportsFastMode(selectedModel);
   const [provider, setProvider] = useState<ModelProvider>(lockedProvider ?? selectedModel.provider);
   // The provider tab follows the open chat, and a locked chat always opens on its own provider.
   useEffect(() => { setProvider(lockedProvider ?? selectedModel.provider); }, [lockedProvider, selectedModel.provider]);
   useEffect(() => { if (modelOpen) { setProvider(lockedProvider ?? selectedModel.provider); onModelPickerOpen(); } }, [modelOpen]);
   const [query, setQuery] = useState("");
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [active, setActive] = useState(0);
   const [engaged, setEngaged] = useState(false);
   const [expanded, setExpanded] = useState(false);
-  const [listening, setListening] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const measureRef = useRef<HTMLSpanElement>(null);
-  const controlsRef = useRef<HTMLDivElement>(null);
-  const modelRef = useRef<HTMLDivElement>(null);
+  const compactWidthRef = useRef(0);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const popoverRootRef = useRef<HTMLDivElement>(null);
   const [anchor, setAnchor] = useState<{ left: number; maxHeight: number; below: boolean; alignRight: boolean }>({ left: 0, maxHeight: 480, below: false, alignRight: true });
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [rowBox, setRowBox] = useState<{ top: number; height: number } | null>(null);
 
-  const token = dismissed ? null : parseToken(draft);
+  const [caret, setCaret] = useState(draft.length);
+  const token = dismissed ? null : promptToken(draft, Math.min(caret, draft.length));
   const menu: "at" | "slash" | null = plusOpen ? "at" : token?.kind ?? null;
   const tokenQuery = plusOpen ? "" : token?.query ?? "";
+  const fileSearch = useProjectFiles(projectPath, tokenQuery, menu === "at" && !plusOpen);
   const { skills, warnings: skillWarnings, loading: skillsLoading } = useSkills(projectPath, menu === "slash");
-  const skillRows = ["workspace", "user"].flatMap((scope) => skills.filter((skill) => skill.scope === scope).map((skill) => ({
+  const skillRows = ["bundled", "workspace", "user"].flatMap((scope) => skills.filter((skill) => skill.scope === scope).map((skill) => ({
     key: `skill:${skill.name}`, name: `/${skill.name}`, desc: skill.description,
-    group: scope === "workspace" ? "Workspace skills" : "User skills", source: skill.provider, path: skill.path,
+    group: scope === "bundled" ? "Milagre skills" : scope === "workspace" ? "Workspace skills" : "User skills", source: skill.provider, path: skill.path,
   })));
   const commands: MenuRow[] = [
     ...COMMANDS.filter((command) => !skills.some((skill) => skill.name.toLowerCase() === command.key)).map((command) => ({ ...command, group: "Milagre skills" })),
     ...skillRows,
   ];
   const rows: MenuRow[] = menu === "at"
-    ? SOURCES.filter((source) => source.name.toLowerCase().includes(tokenQuery))
+    ? plusOpen ? SOURCES : fileSearch.files.map(path => ({ key: `file:${path}`, name: path.split("/").at(-1) || path, desc: path, path }))
     : menu === "slash"
       ? commands.filter((command) => `${command.name.slice(1)} ${command.desc}`.toLowerCase().includes(tokenQuery))
       : [];
   const providerNotice = cliNotice(cliStatus?.[provider]);
   const modelRows = models.filter((model) => model.provider === provider && `${model.name} ${model.id}`.toLowerCase().includes(query.toLowerCase()));
-  const canSend = draft.trim().length > 0 || imageDraft.images.length > 0;
+  const canSend = draft.trim().length > 0 || imageDraft.images.length > 0 || imageDraft.files.length > 0;
 
   useEffect(() => {
     setActive(0);
@@ -194,19 +163,30 @@ export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, 
 
   useLayoutEffect(() => {
     const input = inputRef.current;
-    const controls = controlsRef.current;
-    const measure = measureRef.current;
-    const modelButton = modelRef.current;
-    if (!input || !controls || !measure || !modelButton) return;
-    const fixedControlsWidth = 28 * 3 + modelButton.offsetWidth;
-    const inlineInputWidth = controls.clientWidth - fixedControlsWidth - 16;
-    const needsFullWidth = alwaysExpanded || draft.includes("\n") || measure.offsetWidth + 8 > inlineInputWidth;
-    if (needsFullWidth !== expanded) setExpanded(needsFullWidth);
+    if (!input) return;
     input.style.height = "0px";
     const contentHeight = input.scrollHeight;
     input.style.height = `${Math.min(Math.max(contentHeight, 28), 100)}px`;
     input.style.overflowY = contentHeight > 100 ? "auto" : "hidden";
-  }, [draft, expanded, selectedModel.name, effortLabel, alwaysExpanded]);
+    if (!expanded) compactWidthRef.current = input.clientWidth;
+    let needsFullWidth = alwaysExpanded || draft.includes("\n");
+    if (!needsFullWidth && expanded && draft.length > 0) {
+      // Measure only short drafts when deciding whether the compact layout fits again.
+      // The compact textarea's own scrollHeight detects wrapping as the user types.
+      if (draft.length > 200 || !compactWidthRef.current) needsFullWidth = true;
+      else {
+        const canvas = canvasRef.current ??= document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (context) {
+          context.font = `13px ${getComputedStyle(input).fontFamily}`;
+          needsFullWidth = context.measureText(draft).width + 8 > compactWidthRef.current;
+        }
+      }
+    } else if (!needsFullWidth && !expanded) {
+      needsFullWidth = contentHeight > 28;
+    }
+    if (needsFullWidth !== expanded) setExpanded(needsFullWidth);
+  }, [draft, expanded, selectedModel.name, effortLabel, fastMode, alwaysExpanded]);
 
   useEffect(() => {
     if (!modelOpen && !plusOpen && !permissionOpen && !effortOpen) return;
@@ -250,41 +230,24 @@ export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, 
     inputRef.current?.focus();
   }
 
-  function toggleListening() {
-    if (listening) {
-      recognitionRef.current?.stop();
-      setListening(false);
-      return;
-    }
-    const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-    if (!Recognition) return;
-    const recognition = new Recognition();
-    recognition.lang = "pt-BR";
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
-    recognition.onresult = (event) => {
-      const transcript = event.results[0]?.[0]?.transcript ?? "";
-      if (transcript) onDraftChange(draft ? `${draft.trimEnd()} ${transcript}` : transcript);
-    };
-    recognition.onend = () => setListening(false);
-    recognition.onerror = () => setListening(false);
-    recognitionRef.current = recognition;
-    recognition.start();
-    setListening(true);
-  }
-
-  function pick(row: { key: string; name: string }) {
+  function pick(row: MenuRow) {
     const source = SOURCES.find((item) => item.key === row.key);
     if (source?.key === "attach") {
-      setAttachments((current) => [...current, FILES[current.length % FILES.length]]);
-      if (token) onDraftChange(draft.slice(0, token.start));
+      fileInputRef.current?.click();
     } else if (menu === "at") {
-      onDraftChange(`${token ? draft.slice(0, token.start) : draft}@${row.name} `);
+      if (token && row.path) {
+        const path = fileMentionPath(projectPath, row.path);
+        if (!path) return;
+        imageDraft.attachPath(path);
+        onDraftChange(removePromptToken(draft, token));
+        const position = token.start;
+        requestAnimationFrame(() => inputRef.current?.setSelectionRange(position, position));
+      }
     } else {
-      onDraftChange(`${token ? draft.slice(0, token.start) : draft}${row.name} `);
+      onDraftChange(token ? insertPromptToken(draft, token, row.name) : `${draft}${row.name} `);
     }
     setPlusOpen(false);
-    setDismissed(false);
+    setDismissed(true);
     inputRef.current?.focus();
   }
 
@@ -327,7 +290,7 @@ export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, 
       <div ref={popoverRootRef} className="relative">
         {menu && (
           <div onMouseLeave={() => setEngaged(false)} className="absolute inset-x-0 bottom-full z-20 mb-2 rounded-[10px] border border-line bg-surface p-1 shadow-raised" style={{ animation: "pop-in 180ms cubic-bezier(0.23,1,0.32,1) both", transformOrigin: "bottom center" }}>
-            <div className="relative max-h-64 overflow-y-auto" aria-label={menu === "slash" ? "Commands and skills" : "Sources"}>
+            <div className="relative max-h-64 overflow-y-auto" aria-label={menu === "slash" ? "Commands and skills" : plusOpen ? "Sources" : "Project files"}>
             <span aria-hidden className="pointer-events-none absolute inset-x-1 rounded-[6px] bg-hover" style={{ top: rowBox?.top ?? 0, height: rowBox?.height ?? 0, opacity: rowBox && engaged ? 1 : 0, transition: "top 220ms cubic-bezier(0.23,1,0.32,1), height 220ms cubic-bezier(0.23,1,0.32,1), opacity 150ms ease" }} />
             {rows.map((row, index) => {
               const source = menu === "at" ? SOURCES.find((item) => item.key === row.key) : undefined;
@@ -342,10 +305,11 @@ export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, 
               </button>
               </Fragment>;
             })}
-            {rows.length === 0 && <div className="flex h-9 items-center px-2 text-[12px] text-ink-3">No matches for “{tokenQuery}”</div>}
+            {menu === "at" && !plusOpen && fileSearch.error && <div role="status" className="px-2 text-xs text-red">{fileSearch.error}</div>}
+            {rows.length === 0 && <div className="flex h-9 items-center px-2 text-[12px] text-ink-3">{fileSearch.loading && menu === "at" ? "Searching files..." : `No matches for "${tokenQuery}"`}</div>}
             </div>
             {menu === "slash" && skillWarnings.length > 0 && <div role="status" title={skillWarnings.join("\n")} className="px-2 py-1 text-[11px] text-ink-3">{skillWarnings.length === 1 ? skillWarnings[0] : `${skillWarnings.length} skills could not be loaded. Hover for details.`}</div>}
-            <div className="mt-1 border-t border-line px-2 pt-1.5 pb-1 text-[11px] text-ink-3">{menu === "at" ? "Type to search sources & files" : skillsLoading ? "Loading skills…" : "Type to search commands & skills"}</div>
+            <div className="mt-1 border-t border-line px-2 pt-1.5 pb-1 text-[11px] text-ink-3">{menu === "at" ? "Type to search files" : skillsLoading ? "Loading skills…" : "Type to search commands & skills"}</div>
           </div>
         )}
 
@@ -420,21 +384,21 @@ export function PromptComposer({ imageDraft, projectPath, draft, onDraftChange, 
         )}
 
         <div className={`promptbar-surface relative isolate flex flex-col overflow-visible border border-line bg-surface transition-[border-color,border-radius] duration-150 focus-within:border-line-strong ${expanded ? "gap-2.5 rounded-[22px] p-3.5" : "gap-1.5 rounded-[14px] p-1.5"}`}>
-          {imageDraft.images.length > 0 && <div className="flex flex-wrap gap-2 px-1 pt-1" aria-label="Attached images">{imageDraft.images.map((image) => <div key={image.id} className="relative rounded-lg border border-line bg-inset p-1"><img src={image.dataUrl} alt={image.name} className="size-20 rounded object-contain" /><button type="button" aria-label={`Remove image ${image.name}`} onClick={() => imageDraft.remove(image.id)} className="absolute -top-1 -right-1 flex size-5 items-center justify-center rounded-full border border-line bg-surface text-ink shadow-xs"><Icon icon={Cancel01Icon} size={12} /></button></div>)}</div>}
+          <input ref={fileInputRef} type="file" multiple hidden aria-label="Choose attachments" onChange={event => { void imageDraft.attachFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
+          <Attachments images={imageDraft.images} files={imageDraft.files} removeImage={imageDraft.remove} removeFile={imageDraft.removeFile} />
           {imageDraft.loading && <div role="status" className="px-2 text-xs text-ink-3">Loading images…</div>}
           {imageDraft.error && <div role="alert" className="px-2 text-xs text-red">{imageDraft.error}</div>}
-          {attachments.length > 0 && <div className="flex flex-wrap gap-1.5 px-0.5 pt-0.5">{attachments.map((file, index) => <span key={`${file}-${index}`} className="flex h-6.5 items-center gap-1.5 rounded-chip bg-field py-1 pr-1 pl-1.5 text-[11.5px] text-ink-2 shadow-hairline"><Icon icon={File02Icon} size={12} /><span className="max-w-36 truncate">{file}</span><button type="button" aria-label={`Remove ${file}`} onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} className="flex size-5 items-center justify-center rounded-[5px] text-ink-3 hover:bg-line hover:text-ink"><Icon icon={Cancel01Icon} size={10} /></button></span>)}</div>}
-          <span ref={measureRef} aria-hidden="true" className="pointer-events-none absolute invisible whitespace-pre text-[13px] leading-[18px]">{draft}</span>
-          <div ref={controlsRef} className={`grid items-end gap-x-1 gap-y-1.5 ${expanded ? "grid-cols-[28px_auto_minmax(0,1fr)_auto_28px_28px]" : "grid-cols-[28px_minmax(0,1fr)_auto_auto_28px_28px]"}`}>
+
+          <div className={`grid items-end gap-x-1 gap-y-1.5 ${expanded ? "grid-cols-[28px_auto_minmax(0,1fr)_auto_28px]" : "grid-cols-[28px_minmax(0,1fr)_auto_auto_28px]"}`}>
             <button type="button" aria-label="Add attachments and sources" aria-expanded={plusOpen} onClick={() => { setModelOpen(false); setPlusOpen((current) => !current); inputRef.current?.focus(); }} className={`flex size-7 shrink-0 items-center justify-center text-ink-3 transition-colors hover:bg-hover hover:text-ink ${plusOpen ? "bg-hover" : ""}`}><Icon icon={Add01Icon} size={16} /></button>
-            <textarea onPaste={(event) => void imageDraft.onPaste(event)} ref={inputRef} rows={1} value={draft} onChange={(event) => { onDraftChange(event.target.value); setDismissed(false); setPlusOpen(false); }} onKeyDown={handleKeyDown} placeholder={listening ? "Listening…" : running ? "Steer the agent…" : "Prompt or tag a worktree with @"} aria-label="Prompt" className={`${expanded ? "col-span-full col-start-1 row-start-1 min-h-[68px] px-2 py-2 text-[14px] leading-5" : "col-start-2 row-start-1 min-h-7 px-1 py-[5px] text-[13px] leading-[18px]"} min-w-0 w-full resize-none overflow-hidden bg-transparent text-ink outline-none [overflow-wrap:anywhere] placeholder:text-ink-3`} />
-            <div ref={modelRef} className={`flex shrink-0 items-center gap-0.5 ${expanded ? "col-start-2 row-start-2 justify-self-start" : "col-start-3 row-start-1"}`}>
+            <textarea onPaste={(event) => void imageDraft.onPaste(event)} ref={inputRef} rows={1} value={draft} onSelect={event => setCaret(event.currentTarget.selectionStart)} onChange={(event) => { setCaret(event.target.selectionStart); onDraftChange(event.target.value); setDismissed(false); setPlusOpen(false); }} onKeyDown={handleKeyDown} placeholder={running ? "Steer the agent…" : "Prompt or mention a file with @"} aria-label="Prompt" className={`${expanded ? "col-span-full col-start-1 row-start-1 min-h-[68px] px-2 py-2 text-[14px] leading-5" : "col-start-2 row-start-1 min-h-7 px-1 py-[5px] text-[13px] leading-[18px]"} min-w-0 w-full resize-none overflow-hidden bg-transparent text-ink outline-none [overflow-wrap:anywhere] placeholder:text-ink-3`} />
+            <div className={`flex shrink-0 items-center gap-0.5 ${expanded ? "col-start-2 row-start-2 justify-self-start" : "col-start-3 row-start-1"}`}>
             <button type="button" aria-expanded={modelOpen} onClick={(event) => { anchorTo(event.currentTarget, 360); setPlusOpen(false); setPermissionOpen(false); setEffortOpen(false); setModelOpen((current) => !current); }} className="flex h-7 shrink-0 items-center gap-1 rounded-[8px] px-1.5 text-[12px] font-medium text-ink-2 transition-colors hover:bg-hover hover:text-ink"><ProviderLogo provider={selectedModel.provider} size={13} /><span className="max-w-28 truncate">{selectedModel.name}</span><Icon icon={ArrowDown01Icon} size={12} /></button>
             {effortLevels.length > 0 && <button type="button" aria-label={`Thinking effort: ${effortName}${ultracode ? ", ultracode on" : ""}`} title={`Thinking effort: ${effortName}${ultracode ? ", ultracode on" : ""}`} aria-expanded={effortOpen} onClick={(event) => { anchorTo(event.currentTarget, 320); setPlusOpen(false); setModelOpen(false); setPermissionOpen(false); setEffortOpen((current) => !current); }} className={`flex h-7 shrink-0 items-center gap-1.5 rounded-[8px] px-1.5 text-[12px] font-medium transition-colors hover:bg-hover ${effortOpen ? "bg-hover" : ""} ${orchestrating ? "text-accent-ink" : effortOpen ? "text-ink" : "text-ink-2 hover:text-ink"}`}><EffortMeter level={effortIndex} total={effortLevels.length} /><span className="hidden min-[900px]:inline">{effortLabel}</span></button>}
+            {canUseFastMode && <Tooltip align="end" label={`Fast mode ${fastMode ? "on" : "off"}: faster Opus output at higher usage rates`}><button type="button" aria-label="Fast mode" aria-pressed={fastMode} onClick={() => onFastModeChange(!fastMode)} className={`flex size-7 shrink-0 items-center justify-center rounded-[8px] transition-colors hover:bg-hover ${fastMode ? "bg-accent-tint text-accent-ink" : "text-ink-3 hover:text-ink"}`}><Icon icon={FlashIcon} size={15} /></button></Tooltip>}
             </div>
             <button type="button" aria-label="Agent permissions" aria-expanded={permissionOpen} onClick={(event) => { anchorTo(event.currentTarget, 340); setPlusOpen(false); setModelOpen(false); setEffortOpen(false); setPermissionOpen((current) => !current); }} className={`flex h-7 shrink-0 items-center gap-1 rounded-[8px] px-1.5 text-[12px] font-medium transition-colors hover:bg-hover ${permissionMode === "full" ? "text-ink" : permissionMode === "auto" ? "text-green" : "text-ink-2"} ${expanded ? "col-start-3 row-start-2 justify-self-start" : "col-start-4 row-start-1"}`}><Icon icon={SecurityCheckIcon} size={14} /><span className="hidden min-[900px]:inline">{permissionMode === "ask" ? "Ask" : permissionMode === "auto" ? "Auto" : "Full"}</span></button>
-            <button type="button" aria-label={listening ? "Stop voice input" : "Start voice input"} aria-pressed={listening} onClick={toggleListening} className={`flex size-7 shrink-0 items-center justify-center rounded-[8px] transition-colors ${expanded ? "col-start-5 row-start-2" : "col-start-5 row-start-1"} ${listening ? "bg-accent-tint text-accent-ink" : "text-ink-3 hover:bg-hover hover:text-ink"}`}><Icon icon={Mic01Icon} size={15} /></button>
-            <button type="button" aria-label="Send" disabled={!canSend || sendBlocked || imageDraft.loading} onClick={onSend} className={`flex size-7 shrink-0 items-center justify-center rounded-[8px] text-surface transition-[background-color,color,transform] duration-200 enabled:active:scale-[0.94] disabled:cursor-not-allowed disabled:bg-line-strong disabled:text-ink-2 ${expanded ? "col-start-6 row-start-2" : "col-start-6 row-start-1"}`} style={{ background: canSend && !sendBlocked ? "var(--ink)" : "var(--line-strong)" }}><Icon icon={ArrowUp01Icon} size={16} /></button>
+            <button type="button" aria-label="Send" disabled={!canSend || sendBlocked || imageDraft.loading} onClick={onSend} className={`flex size-7 shrink-0 items-center justify-center rounded-[8px] text-surface transition-[background-color,color,transform] duration-200 enabled:active:scale-[0.94] disabled:cursor-not-allowed disabled:bg-line-strong disabled:text-ink-2 ${expanded ? "col-start-5 row-start-2" : "col-start-5 row-start-1"}`} style={{ background: canSend && !sendBlocked ? "var(--ink)" : "var(--line-strong)" }}><Icon icon={ArrowUp01Icon} size={16} /></button>
           </div>
         </div>
       </div>

@@ -1,3 +1,4 @@
+import { SpinnerRing } from "../primitives/SpinnerRing";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { HugeiconsIcon } from "@hugeicons/react";
@@ -9,13 +10,20 @@ import {
   Folder01Icon,
   FolderOpenIcon,
   GitBranchIcon,
-  MoreHorizontalIcon,
+  GitMergeIcon,
+  GitPullRequestIcon,
+  LinkSquare02Icon,
+  MoreVerticalIcon,
   PencilEdit02Icon,
+  SourceCodeIcon,
   Tick02Icon,
 } from "@hugeicons/core-free-icons";
 import GlideMenu from "@/components/primitives/GlideMenu";
+import Tooltip from "@/components/primitives/Tooltip";
+import { archiveChoices, type ArchiveMode, type ArchivePlan } from "@/lib/archive";
 import { folderName, formatLineCount, type ChatMark } from "@/lib/chat-list";
-import type { DiffStat } from "@/model";
+import { useEditors } from "@/lib/editors";
+import type { DiffStat, PullRequest } from "@/model";
 
 type HugeIconData = Parameters<typeof HugeiconsIcon>[0]["icon"];
 
@@ -28,6 +36,7 @@ export type ChatDetails = {
   branch?: string;
   path?: string;
   diff?: DiffStat;
+  pullRequest?: PullRequest;
   /** The chat's last turn failed. */
   failed?: boolean;
 };
@@ -47,8 +56,16 @@ export type ChatRowActions = {
   onRename?: (id: string, title: string) => void;
   onMarkUnread?: (id: string, unread: boolean) => void;
   onReveal?: (id: string) => void;
-  onArchive?: (id: string) => void;
+  onOpenInEditor?: (id: string) => void;
+  /** Opens the chat with its "Commit and open PR" dialog. */
+  onCommit?: (id: string) => void;
+  /** Looks at the chat's worktree when "Archive" is clicked, to decide what the confirm step offers. */
+  onArchiveCheck?: (id: string) => Promise<ArchivePlan>;
+  onArchive?: (id: string, mode: ArchiveMode, plan: ArchivePlan) => void;
 };
+
+/** What the confirm step offers when nothing is known about the worktree: only hide the chat. */
+const HIDE_ONLY: ArchivePlan = { milagreOwned: false, shared: false, status: null };
 
 const MARK_LABEL: Record<Exclude<ChatMark, "idle">, string> = {
   waiting: "Waiting for you",
@@ -58,30 +75,12 @@ const MARK_LABEL: Record<Exclude<ChatMark, "idle">, string> = {
 
 const HOVER_CARD_DELAY = 500;
 const HOVER_CARD_WIDTH = 256;
-const MENU_WIDTH = 208;
+const MENU_WIDTH = 240;
+
+type MenuEntry = { key: string; label: string; icon: HugeIconData; onSelect: () => void; disabled?: boolean; danger?: boolean; archiveChoice?: boolean };
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent);
 
-/** A ring with an arc sweeping round it, as on the task rows: a turn is running. */
-function SpinnerRing({ size, stroke = 2 }: { size: number; stroke?: number }) {
-  const radius = (size - stroke) / 2;
-  const circumference = 2 * Math.PI * radius;
-  return (
-    <svg width={size} height={size} aria-hidden className="shrink-0" style={{ animation: "spin 1.1s linear infinite" }}>
-      <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="var(--line)" strokeWidth={stroke} />
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={radius}
-        fill="none"
-        stroke="var(--ink-3)"
-        strokeWidth={stroke}
-        strokeLinecap="round"
-        strokeDasharray={`${circumference * 0.28} ${circumference * 0.72}`}
-      />
-    </svg>
-  );
-}
 
 /* ─────────────────────────────────────────────────────────
  * CHAT MARK
@@ -89,13 +88,13 @@ function SpinnerRing({ size, stroke = 2 }: { size: number; stroke?: number }) {
  * a halo), running spins a ring, unread is a plain accent dot,
  * and an idle chat keeps a faint dot so labels stay aligned.
  * ───────────────────────────────────────────────────────── */
-function ChatMarkDot({ mark }: { mark: ChatMark }) {
+function ChatMarkDot({ mark, topAligned = false }: { mark: ChatMark; topAligned?: boolean }) {
   const dot =
     mark === "waiting" ? "size-2 bg-accent ring-[3px] ring-accent-tint"
     : mark === "unread" ? "size-2 bg-accent"
     : "size-1.5 bg-ink-3 opacity-40";
   return (
-    <span className="sidebar-copy mr-2 flex size-3 shrink-0 items-center justify-center">
+    <span className={`sidebar-copy mr-2 flex size-3 shrink-0 items-center justify-center ${topAligned ? "mt-1" : ""}`}>
       <span
         data-slot="chat-mark"
         data-mark={mark}
@@ -121,14 +120,18 @@ export function ChatRow({
   collapsed,
   onPick,
   actions,
+  shortcutHint,
 }: {
   item: SidebarRecent;
   active: boolean;
   collapsed: boolean;
   onPick: () => void;
   actions: ChatRowActions;
+  shortcutHint?: string;
 }) {
   const mark = item.mark ?? "idle";
+  const pullRequest = !collapsed ? item.details?.pullRequest : undefined;
+  const readyToMerge = pullRequest?.state === "OPEN" && pullRequest.readyToMerge;
   const rowRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const hoverTimer = useRef<number | null>(null);
@@ -194,7 +197,7 @@ export function ChatRow({
           type="button"
           onClick={onPick}
           aria-current={active ? "page" : undefined}
-          className={`sidebar-row relative z-10 mx-2 flex h-8 items-center rounded-[8px] px-2 text-left transition-[width,background-color,color,transform] duration-150 active:scale-[0.98] ${
+          className={`sidebar-row relative z-10 mx-2 flex ${pullRequest ? "h-[46px] items-start pt-1.5" : "h-8 items-center"} rounded-[8px] px-2 text-left transition-[width,background-color,color,transform] duration-150 active:scale-[0.98] ${
             active ? "bg-hover-2 group-hover/glide:bg-transparent" : ""
           }`}
         >
@@ -208,9 +211,9 @@ export function ChatRow({
               <span aria-hidden className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-accent ring-2 ring-surface" />
             )}
           </span>
-          <ChatMarkDot mark={mark} />
+          <ChatMarkDot mark={mark} topAligned={Boolean(pullRequest)} />
           <span
-            className={`sidebar-copy min-w-0 flex-1 truncate text-[14px] transition-[padding] duration-150 group-hover/row:pr-6 ${menu ? "pr-6" : ""} ${
+            className={`sidebar-copy min-w-0 flex-1 truncate text-[14px] ${pullRequest ? "leading-5" : ""} transition-[padding] duration-150 ${shortcutHint ? "pr-10" : "group-hover/row:pr-6"} ${menu ? "pr-6" : ""} ${
               item.unread ? "font-semibold text-ink" : active ? "font-medium text-ink" : "font-medium text-ink-2"
             }`}
           >
@@ -219,7 +222,38 @@ export function ChatRow({
         </button>
       )}
 
-      {!collapsed && !renaming && (
+      {pullRequest && !renaming && (
+        <Tooltip
+          label={readyToMerge ? `Ready to merge · Pull request #${pullRequest.number}` : `${pullRequest.state === "MERGED" ? "Merged" : "Open"} pull request #${pullRequest.number}`}
+          side="bottom"
+          className="sidebar-copy absolute bottom-1 left-9 z-20 max-w-[calc(100%-72px)]"
+        >
+          <a
+            href={pullRequest.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={`Open ${pullRequest.state === "MERGED" ? "merged " : ""}pull request #${pullRequest.number}${readyToMerge ? ", ready to merge" : ""}`}
+            data-chat-pr
+            className="group/pr inline-flex min-w-0 items-center gap-1 rounded-sm text-[12px] leading-4 tabular-nums text-ink-3 no-underline hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <span aria-hidden className={`inline-flex group-hover/pr:hidden group-focus-visible/pr:hidden ${pullRequest.state === "MERGED" ? "text-purple-500" : "text-green"}`}>
+              <HugeIcon icon={pullRequest.state === "MERGED" ? GitMergeIcon : readyToMerge ? Tick02Icon : GitPullRequestIcon} size={12} />
+            </span>
+            <span aria-hidden className="hidden group-hover/pr:inline-flex group-focus-visible/pr:inline-flex">
+              <HugeIcon icon={LinkSquare02Icon} size={12} />
+            </span>
+            <span className="truncate">#{pullRequest.number}</span>
+            {readyToMerge && <span className="shrink-0 text-green">Ready</span>}
+          </a>
+        </Tooltip>
+      )}
+
+      {shortcutHint && !renaming && !menu && <kbd aria-hidden="true" data-shortcut-hint
+        className={`pointer-events-none absolute right-3 top-1.5 z-30 rounded border border-line bg-surface px-1 text-[11px] leading-5 text-ink ${collapsed ? "right-1" : ""}`}>
+        {shortcutHint}
+      </kbd>}
+      {!collapsed && !renaming && !shortcutHint && (
         <button
           ref={triggerRef}
           type="button"
@@ -231,11 +265,11 @@ export function ChatRow({
             if (menu) setMenu(null);
             else openMenu(rect.left, rect.bottom + 4);
           }}
-          className={`absolute right-3 top-1/2 z-20 flex size-6 -translate-y-1/2 items-center justify-center rounded-[6px] text-ink-3 transition-[opacity,background-color,color] duration-100 hover:bg-hover hover:text-ink focus-visible:opacity-100 group-hover/row:opacity-100 ${
+          className={`absolute right-3 ${pullRequest ? "top-1" : "top-1/2 -translate-y-1/2"} z-20 flex size-6 items-center justify-center rounded-[6px] text-ink-3 transition-[opacity,background-color,color] duration-100 hover:bg-hover hover:text-ink focus-visible:opacity-100 group-hover/row:opacity-100 ${
             menu ? "bg-hover text-ink opacity-100" : "opacity-0"
           }`}
         >
-          <HugeIcon icon={MoreHorizontalIcon} size={16} />
+          <HugeIcon icon={MoreVerticalIcon} size={16} />
         </button>
       )}
 
@@ -322,6 +356,16 @@ function ChatHoverCard({ item, position }: { item: SidebarRecent; position: { to
             <span className={status.tone}>{status.label}</span>
           </CardLine>
         )}
+        {details.pullRequest && (
+          <CardLine icon={<span className={details.pullRequest.state === "MERGED" ? "text-purple-500" : "text-green"}><HugeIcon icon={details.pullRequest.state === "MERGED" ? GitMergeIcon : GitPullRequestIcon} size={14} /></span>}>
+            <span className="min-w-0 truncate leading-snug">#{details.pullRequest.number}{details.pullRequest.title ? ` · ${details.pullRequest.title}` : ""}</span>
+          </CardLine>
+        )}
+        {details.pullRequest?.state === "OPEN" && details.pullRequest.readyToMerge && (
+          <CardLine icon={<span className="text-green"><HugeIcon icon={Tick02Icon} size={14} /></span>}>
+            <span className="text-green">Ready to merge</span>
+          </CardLine>
+        )}
         {details.diff && (
           <CardLine icon={<HugeIcon icon={FileEditIcon} size={14} />}>
             {details.diff.added === 0 && details.diff.removed === 0 ? (
@@ -357,7 +401,7 @@ function CardLine({ icon, children }: { icon: ReactNode; children: ReactNode }) 
 
 /* ─────────────────────────────────────────────────────────
  * ACTIONS MENU
- * From the row's ⋯ button or a right-click. Archive hides the
+ * From the row's ⋮ button or a right-click. Archive hides the
  * chat for good (there is no archived list), so it asks twice.
  * ───────────────────────────────────────────────────────── */
 function ChatMenu({
@@ -370,7 +414,7 @@ function ChatMenu({
 }: {
   item: SidebarRecent;
   position: { x: number; y: number };
-  /** The ⋯ button toggles the menu itself, so a press on it isn't an outside press. */
+  /** The ⋮ button toggles the menu itself, so a press on it isn't an outside press. */
   trigger: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
   onRename: () => void;
@@ -378,17 +422,36 @@ function ChatMenu({
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [archiveArmed, setArchiveArmed] = useState(false);
+  // What the confirm step offers: unknown until the worktree has been looked at.
+  const [plan, setPlan] = useState<ArchivePlan | "checking" | null>(null);
   const [top, setTop] = useState(position.y);
   const { details = {} } = item;
+  const running = item.mark === "running" || item.mark === "waiting";
 
+  useLayoutEffect(() => {
+    menuRef.current?.querySelector<HTMLElement>("[data-menu-row]")?.focus();
+  }, []);
+
+  // The confirm step can add items and a line, so the height is measured again with it.
   useLayoutEffect(() => {
     const menu = menuRef.current;
     if (!menu) return;
     // Opens upwards when there isn't room below.
     const height = menu.getBoundingClientRect().height;
     setTop(position.y + height > window.innerHeight - 8 ? Math.max(8, position.y - height - 8) : position.y);
-    menu.querySelector<HTMLElement>("[data-menu-row]")?.focus();
-  }, [position.y]);
+    if (archiveArmed) menu.querySelector<HTMLElement>("[data-archive-choice]:not(:disabled)")?.focus();
+  }, [position.y, archiveArmed, plan]);
+
+  const armArchive = () => {
+    setArchiveArmed(true);
+    if (!actions.onArchiveCheck) {
+      setPlan(HIDE_ONLY);
+      return;
+    }
+    setPlan("checking");
+    // A worktree that can't be checked only hides the chat, as before.
+    actions.onArchiveCheck(item.id).then(setPlan, () => setPlan(HIDE_ONLY));
+  };
 
   useEffect(() => {
     const close = (event: PointerEvent) => {
@@ -414,9 +477,25 @@ function ChatMenu({
     onClose();
     action();
   };
+  const { editor } = useEditors();
   const copy = (text: string) => run(() => void navigator.clipboard.writeText(text).catch(() => {}));
 
-  const items: Array<{ key: string; label: string; icon: HugeIconData; onSelect: () => void; disabled?: boolean; danger?: boolean } | "divider"> = [
+  const resolved = plan && plan !== "checking" ? plan : null;
+  const confirm = resolved ? archiveChoices({ plan: resolved, running }) : null;
+  const archiveItems: Array<MenuEntry> = !archiveArmed
+    ? [{ key: "archive", label: "Archive", icon: Archive02Icon, onSelect: armArchive, disabled: !actions.onArchive }]
+    : confirm
+      ? confirm.choices.map((choice) => ({
+          key: `archive-${choice.mode}`,
+          label: choice.label,
+          icon: Archive02Icon,
+          onSelect: run(() => resolved && actions.onArchive?.(item.id, choice.mode, resolved)),
+          danger: choice.tone === "danger",
+          archiveChoice: true,
+        }))
+      : [{ key: "archive-checking", label: "Checking worktree…", icon: Archive02Icon, onSelect: () => {}, disabled: true, archiveChoice: true }];
+
+  const items: Array<MenuEntry | "divider"> = [
     { key: "copy-path", label: "Copy path", icon: Copy01Icon, onSelect: copy(details.path ?? ""), disabled: !details.path },
     { key: "copy-branch", label: "Copy branch name", icon: GitBranchIcon, onSelect: copy(details.branch ?? ""), disabled: !details.branch },
     { key: "rename", label: "Rename chat", icon: PencilEdit02Icon, onSelect: run(onRename), disabled: !actions.onRename },
@@ -424,10 +503,11 @@ function ChatMenu({
       ? { key: "read", label: "Mark as read", icon: Tick02Icon, onSelect: run(() => actions.onMarkUnread?.(item.id, false)), disabled: !actions.onMarkUnread }
       : { key: "unread", label: "Mark as unread", icon: CircleIcon, onSelect: run(() => actions.onMarkUnread?.(item.id, true)), disabled: !actions.onMarkUnread },
     { key: "reveal", label: IS_MAC ? "Open in Finder" : "Open in file manager", icon: FolderOpenIcon, onSelect: run(() => actions.onReveal?.(item.id)), disabled: !actions.onReveal || !details.path },
+    { key: "editor", label: editor ? `Open in ${editor.name}` : "No editor found", icon: SourceCodeIcon, onSelect: run(() => actions.onOpenInEditor?.(item.id)), disabled: !editor || !actions.onOpenInEditor || !details.path },
+    // Every chat's folder came from `git worktree list`, so a chat with a folder is in a repository.
+    { key: "commit", label: "Commit and open PR…", icon: GitPullRequestIcon, onSelect: run(() => actions.onCommit?.(item.id)), disabled: !actions.onCommit || !details.path },
     "divider",
-    archiveArmed
-      ? { key: "archive", label: item.mark === "running" || item.mark === "waiting" ? "Stop and archive" : "Confirm archive", icon: Archive02Icon, onSelect: run(() => actions.onArchive?.(item.id)), danger: true }
-      : { key: "archive", label: "Archive", icon: Archive02Icon, onSelect: () => setArchiveArmed(true), disabled: !actions.onArchive },
+    ...archiveItems,
   ];
 
   const moveFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -468,16 +548,18 @@ function ChatMenu({
               type="button"
               disabled={entry.disabled}
               onClick={entry.onSelect}
-              className={`relative z-10 flex h-8 w-full items-center gap-2 rounded-[8px] px-2 text-left outline-none focus-visible:bg-hover-2 disabled:opacity-40 ${entry.danger ? "text-red" : "text-ink"}`}
+              {...(entry.archiveChoice ? { "data-archive-choice": true } : {})}
+              className={`relative z-10 flex w-full items-center gap-2 rounded-[8px] px-2 text-left outline-none focus-visible:bg-hover-2 disabled:opacity-40 ${entry.archiveChoice ? "min-h-8 py-1.5" : "h-8"} ${entry.danger ? "text-red" : "text-ink"}`}
             >
               <span className={`flex size-5 shrink-0 items-center justify-center ${entry.danger ? "text-red" : "text-ink-2"}`}>
                 <HugeIcon icon={entry.icon} size={16} />
               </span>
-              <span className="min-w-0 flex-1 truncate text-[13px]">{entry.label}</span>
+              <span className={`min-w-0 flex-1 text-[13px] ${entry.archiveChoice ? "leading-snug" : "truncate"}`}>{entry.label}</span>
             </button>
           ),
         )}
       </GlideMenu>
+      {confirm?.reason && <p data-archive-reason className="px-2 pb-1 pt-1.5 text-[12px] leading-snug text-ink-3">{confirm.reason}</p>}
     </div>,
     document.body,
   );

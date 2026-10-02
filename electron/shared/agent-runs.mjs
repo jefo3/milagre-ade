@@ -128,8 +128,11 @@ export function applyRunEvent(runs, chatId, event, model = "") {
       if (questions.length === run.questions.length && !(event.requestId in run.answered)) return runs;
       return { ...runs, [chatId]: { ...run, questions, answered } };
     }
+    case "subagents-waiting":
+      return run ? { ...runs, [chatId]: { ...run, waitingForSubagents: event.waiting } } : runs;
+    // Text from the parent agent means it's no longer waiting on its subagents.
     case "text-delta":
-      return run ? { ...runs, [chatId]: { ...run, text: run.text + event.text } } : runs;
+      return run ? { ...runs, [chatId]: { ...run, text: run.text + event.text, ...(run.waitingForSubagents ? { waitingForSubagents: false } : {}) } } : runs;
     case "step-started": {
       if (!run) return runs;
       const step = { ...event.step, ...(event.step.detail === undefined ? {} : { detail: capOutput(event.step.detail) }), status: "running", offset: run.text.length };
@@ -168,6 +171,22 @@ export function applyAgentEvent(state, runs, projectPath, chatId, event) {
   if (!chatInProject(projectPath, chatId) || !session) return { state, runs, changed: false };
   const run = runs[chatId];
   switch (event.type) {
+    case "subagent-update": {
+      const children = session.subagents ?? [];
+      const previous = children.find((agent) => agent.id === event.agent.id);
+      if (previous && previous.updatedAt > event.agent.updatedAt) return { state, runs, changed: false };
+      // A resumed provider can rediscover a child before it has replayed the earlier output.
+      const agent = previous ? {
+        ...event.agent,
+        archived: previous.archived,
+        title: event.agent.title === "Subagent" ? previous.title : event.agent.title,
+        prompt: event.agent.prompt ?? previous.prompt,
+        startedAt: Math.min(previous.startedAt, event.agent.startedAt),
+        transcript: [...new Map([...previous.transcript, ...event.agent.transcript].map((entry) => [entry.id, entry])).values()].slice(-100),
+      } : event.agent;
+      const subagents = previous ? children.map((child) => (child.id === agent.id ? agent : child)) : [...children, agent];
+      return { state: { ...state, sessions: { ...state.sessions, [sessionId]: { ...session, subagents } } }, runs, changed: true };
+    }
     case "session-started": {
       if (session.native_session_id === event.nativeId) return { state, runs, changed: false };
       return { state: { ...state, sessions: { ...state.sessions, [sessionId]: { ...session, native_session_id: event.nativeId } } }, runs, changed: true };
@@ -213,7 +232,7 @@ function replyBody(text, event, hasSteps) {
     const failure = event.notice ? event.message : `Agent error: ${event.message}`;
     return reply ? `${reply}\n\n${failure}` : failure;
   }
-  if (event.type === "turn-cancelled") return reply ? `${reply}\n\nAgent run cancelled.` : "Agent run cancelled.";
+  if (event.type === "turn-cancelled") return reply ? `${reply}\n\nWhat should I work on instead?` : "What should I work on instead?";
   return reply || (hasSteps ? "" : "The agent finished without a reply.");
 }
 

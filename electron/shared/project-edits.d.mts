@@ -1,4 +1,4 @@
-import type { AgentSession, CoordinatorState, DiffStat } from "../../app/src/model";
+import type { AgentSession, CoordinatorState, DiffStat, Subagent } from "../../app/src/model";
 
 export type SessionPatch = Partial<Pick<AgentSession, "title" | "unread" | "archived">>;
 
@@ -8,3 +8,6 @@ export type WorktreeRename = { projectPath: string; path: string; from: string; 
 export function patchSession(state: CoordinatorState, sessionId: number, patch: SessionPatch): CoordinatorState;
 export function withDiffStats(state: CoordinatorState, stats: Record<number, DiffStat | null>): CoordinatorState;
 export function renameWorktree(state: CoordinatorState, rename: Pick<WorktreeRename, "path" | "from" | "name">): CoordinatorState;
+export function subagentFinished(agent: Subagent): boolean;
+export function archiveSubagent(state: CoordinatorState, sessionId: number, id: string, archived: boolean): CoordinatorState;
+export function archiveFinishedSubagents(state: CoordinatorState, sessionId: number): CoordinatorState;

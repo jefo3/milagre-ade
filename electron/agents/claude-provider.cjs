@@ -1,13 +1,19 @@
+const { settleSubagents } = require("./subagents.cjs");
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const { killTree } = require("./process-tree.cjs");
-const { MILAGRE_INSTRUCTIONS, RESUME_FAILED_MESSAGE, crashMessage, failedWith, isTerminal, mapClaudeMessage, missingCliMessage } = require("./events.cjs");
+const { milagreInstructions, RESUME_FAILED_MESSAGE, crashMessage, failedWith, isTerminal, mapClaudeMessage, missingCliMessage } = require("./events.cjs");
 const { PendingPermissions, claudeRequest, claudeResult, insideRoot } = require("./permissions.cjs");
 const { PendingQuestions, claudeQuestionRequest, claudeQuestionResult } = require("./questions.cjs");
 
 // Milagre permission mode -> Claude Code permission mode. In Ask (`default`) Claude Code checks with
 // the user, through canUseTool, before edits and commands its rules don't already allow.
 const CLAUDE_MODES = { ask: "default", auto: "acceptEdits", full: "bypassPermissions" };
+
+// Claude Code's built-in terse output style. Unlike text appended to the system prompt, which the SDK
+// records with a conversation and ignores on later turns and resumes, the style applies to new chats, to
+// resumed chats and to the running query, all through applyFlagSettings before the turn's message.
+const CONCISE_STYLE = "Concise";
 
 // Claude Code prints this when --resume names a session it no longer has.
 const MISSING_CONVERSATION = /No conversation found/i;
@@ -48,8 +54,8 @@ function userMessage(prompt, images = []) {
 const sessionClosedError = () => Object.assign(new Error("The agent session closed before this message was sent."), { sessionClosed: true });
 
 class ClaudeSession {
-  constructor({ cwd, resumeId, command, emit, loadSdk = () => import("@anthropic-ai/claude-agent-sdk"), spawnImpl = spawn, interruptGraceMs = 3000 }) {
-    Object.assign(this, { cwd, resumeId, command, emit, loadSdk, spawnImpl, interruptGraceMs });
+  constructor({ cwd, resumeId, command, emit, tldrEnabled = true, loadSdk = () => import("@anthropic-ai/claude-agent-sdk"), spawnImpl = spawn, interruptGraceMs = 3000 }) {
+    Object.assign(this, { cwd, resumeId, command, emit, tldrEnabled, loadSdk, spawnImpl, interruptGraceMs });
     this.state = { sessionId: resumeId ?? null, turnId: null, hasText: false };
     this.query = null;
     this.inbox = null;
@@ -92,12 +98,12 @@ class ClaudeSession {
     }
   }
 
-  async beginTurn({ prompt, images = [], model, permissionMode, effort, ultracode = false }) {
+  async beginTurn({ prompt, images = [], model, permissionMode, effort, ultracode = false, fastMode = false, replies }) {
     const turnId = randomUUID();
     Object.assign(this.state, { turnId, hasText: false });
     this.permissions.setMode(permissionMode);
     try {
-      if (!this.query) await this.start(model, CLAUDE_MODES[permissionMode] ?? "default", effort, ultracode);
+      if (!this.query) await this.start(model, CLAUDE_MODES[permissionMode] ?? "default", effort, ultracode, fastMode);
       if (!this.closed) {
         if (model !== this.model) {
           await this.query.setModel(model);
@@ -115,6 +121,11 @@ class ClaudeSession {
           this.effort = effort;
           this.ultracode = ultracode;
         }
+        if (fastMode !== this.fastMode) {
+          await this.query.applyFlagSettings({ fastMode });
+          this.fastMode = fastMode;
+        }
+        await this.applyReplyStyle(replies);
       }
     } catch (error) {
       this.finishTurn({ type: "turn-failed", message: error.message });
@@ -133,6 +144,20 @@ class ClaudeSession {
     this.inbox.push(userMessage(prompt, images));
     this.emit({ type: "turn-started", turnId });
     return { turnId, steered: false };
+  }
+
+  // Concise is Claude Code's flag-layer outputStyle; Normal clears it (null), which falls back to the style
+  // in the user's own Claude settings, exactly what the session would have without Milagre. A CLI that
+  // rejects the style costs only the style: it is dropped for this session, never retried, and the turn runs.
+  async applyReplyStyle(replies) {
+    const wanted = replies === "concise" && !this.styleFailed ? CONCISE_STYLE : null;
+    if (wanted === this.outputStyle) return;
+    try {
+      await this.query.applyFlagSettings({ outputStyle: wanted });
+      this.outputStyle = wanted;
+    } catch {
+      this.styleFailed = true;
+    }
   }
 
   // A message for the running turn goes straight into Claude Code's input. Claude Code picks it up at
@@ -166,7 +191,7 @@ class ClaudeSession {
     this.emit({ type: "turn-started", turnId });
   }
 
-  async start(model, mode, effort, ultracode = false) {
+  async start(model, mode, effort, ultracode = false, fastMode = false) {
     const { query } = await this.loadSdk();
     if (this.closed) return;
     this.stderr = "";
@@ -176,6 +201,8 @@ class ClaudeSession {
     this.mode = mode;
     this.effort = effort;
     this.ultracode = ultracode;
+    this.fastMode = fastMode;
+    this.outputStyle = null;
     this.query = query({
       prompt: this.inbox,
       options: {
@@ -183,12 +210,13 @@ class ClaudeSession {
         model,
         permissionMode: mode,
         ...(effort ? { effort } : {}),
-        ...(ultracode ? { settings: { ultracode: true } } : {}),
+        settings: { fastMode, ...(ultracode ? { ultracode: true } : {}) },
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true,
+        forwardSubagentText: true,
         pathToClaudeCodeExecutable: this.command,
         settingSources: ["user", "project", "local"],
-        systemPrompt: { type: "preset", preset: "claude_code", append: MILAGRE_INSTRUCTIONS },
+        systemPrompt: { type: "preset", preset: "claude_code", append: milagreInstructions(this.tldrEnabled) },
         canUseTool: (toolName, input, options) => (toolName === "AskUserQuestion" ? this.askQuestion(input, options) : this.askPermission(toolName, input, options)),
         ...(this.resumeId ? { resume: this.resumeId } : {}),
         // Own the process so close() can stop Claude Code and everything it started.
@@ -303,6 +331,7 @@ class ClaudeSession {
     if (query !== this.query) return;
     this.query = null;
     this.closed = true;
+    settleSubagents(this.state, this.cancelRequested ? "cancelled" : "failed").forEach(event => this.emit(event));
     if (!this.turnActive) return;
     if (this.cancelRequested) this.finishTurn({ type: "turn-cancelled" });
     else if (this.resumeGone(error?.message ?? "")) this.resumeFailed();
@@ -325,6 +354,7 @@ class ClaudeSession {
     this.questions.cancelAll();
     // Tool calls still waiting for a result never get one, nor does thinking that was cut off.
     this.state.tools?.clear();
+    this.state.foregroundChildren?.clear();
     this.state.thinking = null;
     this.emit(event);
     markEnded();
@@ -346,6 +376,7 @@ class ClaudeSession {
   }
 
   async close() {
+    settleSubagents(this.state, "cancelled").forEach(event => this.emit(event));
     this.permissions.cancelAll();
     this.questions.cancelAll();
     if (this.turnActive) this.cancelRequested = true;

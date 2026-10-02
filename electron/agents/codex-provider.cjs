@@ -1,8 +1,9 @@
+const { active: activeSubagent, settleSubagents } = require("./subagents.cjs");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { CodexRpc } = require("./codex-rpc.cjs");
-const { MILAGRE_INSTRUCTIONS, RESUME_FAILED_MESSAGE, crashMessage, failedWith, isTerminal, loginMessage, mapCodexNotification, missingCliMessage } = require("./events.cjs");
+const { milagreInstructions, RESUME_FAILED_MESSAGE, crashMessage, failedWith, isTerminal, loginMessage, mapCodexNotification, missingCliMessage } = require("./events.cjs");
 const { PendingPermissions, codexCommandRequest, codexDecision, codexFileRequest, insideRoot } = require("./permissions.cjs");
 const { PendingQuestions, codexQuestionRequest, codexQuestionResponse } = require("./questions.cjs");
 
@@ -40,8 +41,8 @@ const ACCOUNT_TIMEOUT_MS = 8000;
 const sessionClosedError = () => Object.assign(new Error("The agent session closed before this message was sent."), { sessionClosed: true });
 
 class CodexSession {
-  constructor({ cwd, resumeId, command, emit, clientVersion = "0.0.0", interruptGraceMs = 3000, createRpc = (options) => new CodexRpc(options) }) {
-    Object.assign(this, { cwd, resumeId, command, emit, clientVersion, interruptGraceMs, createRpc });
+  constructor({ cwd, resumeId, command, emit, tldrEnabled = true, clientVersion = "0.0.0", interruptGraceMs = 3000, createRpc = (options) => new CodexRpc(options) }) {
+    Object.assign(this, { cwd, resumeId, command, emit, tldrEnabled, clientVersion, interruptGraceMs, createRpc });
     // steps: ids of the tool steps started in this turn and not yet completed.
     this.state = { threadId: resumeId ?? null, turnId: null, lastItemId: null, hasText: false, steps: new Set() };
     this.rpc = null;
@@ -167,7 +168,7 @@ class CodexSession {
     await rpc.request("initialize", { clientInfo: { name: "milagre", title: "Milagre", version: this.clientVersion }, capabilities: null });
     rpc.notify("initialized");
     await this.checkLogin(rpc);
-    const threadParams = { cwd: this.cwd, model, approvalPolicy: policy.approvalPolicy, sandbox: policy.sandbox, developerInstructions: MILAGRE_INSTRUCTIONS, config: THREAD_CONFIG };
+    const threadParams = { cwd: this.cwd, model, approvalPolicy: policy.approvalPolicy, sandbox: policy.sandbox, developerInstructions: milagreInstructions(this.tldrEnabled), config: THREAD_CONFIG };
     const thread = this.resumeId ? await this.resume(threadParams) : (await this.requestThread("thread/start", threadParams)).thread;
     if (thread?.id && thread.id !== this.state.threadId) {
       this.state.threadId = thread.id;
@@ -225,6 +226,7 @@ class CodexSession {
     if (method === "turn/started" && !this.turnActive) return;
     if (method === "turn/started" && params.threadId === this.state.threadId) this.state.turnId ??= params.turn?.id ?? null;
     const events = mapCodexNotification(method, params, this.state);
+    if (events.some(event => event.type === "subagent-update")) this.scheduleSubagents();
     if (!events.some(isTerminal)) {
       events.forEach((event) => this.emit(event));
       return;
@@ -234,6 +236,62 @@ class CodexSession {
     // An app-server that answered 401 holds the old credentials; the next message starts a fresh one.
     if (loggedOut) void finished.then(() => this.close());
     else void finished;
+  }
+
+  // Native children need not be subscribed on the parent's connection. Read their history
+  // without resuming them, then route it through the same child-only event mapper.
+  scheduleSubagents() {
+    if (this.closed || this.subagentTimer) return;
+    this.subagentTimer = setTimeout(async () => {
+      this.subagentTimer = null;
+      await this.refreshSubagents();
+      if ([...(this.state.subagents?.values() ?? [])].some(activeSubagent)) this.scheduleSubagents();
+    }, 1500);
+    this.subagentTimer.unref?.();
+  }
+
+  async readSubagentThread(threadId) {
+    try {
+      return (await this.rpc.request("thread/read", { threadId, includeTurns: true }, { timeoutMs: 5000 })).thread;
+    } catch (error) {
+      if (!error.rpcError) throw error;
+      // Newer threads require paginated history. The panel retains recent activity only.
+      const { thread } = await this.rpc.request("thread/read", { threadId }, { timeoutMs: 5000 });
+      const page = await this.rpc.request("thread/turns/list", { threadId, limit: 20, sortDirection: "desc", itemsView: "full" }, { timeoutMs: 5000 });
+      return { ...thread, turns: [...page.data].reverse() };
+    }
+  }
+
+  async refreshSubagents() {
+    this.childHistory ??= new Map();
+    for (const agent of [...(this.state.subagents?.values() ?? [])]) {
+      if (this.closed) return;
+      if (!activeSubagent(agent) && this.childHistory.get(agent.id)?.finished) continue;
+      try {
+        const thread = await this.readSubagentThread(agent.id);
+        if (this.closed) return;
+        const turns = thread?.turns ?? [];
+        const fingerprint = JSON.stringify({ turns, status: thread?.status });
+        if (this.childHistory.get(agent.id)?.fingerprint === fingerprint) continue;
+        const items = new Map(this.childHistory.get(agent.id)?.items);
+        for (const turn of turns) {
+          for (const item of turn.items ?? []) {
+            const itemKey = `${turn.id}:${item.id}`;
+            const encoded = JSON.stringify(item);
+            if (items.get(itemKey) === encoded) continue;
+            items.set(itemKey, encoded);
+            for (const event of mapCodexNotification("item/completed", { threadId: agent.id, item }, this.state)) this.emit(event);
+          }
+        }
+        const last = turns.at(-1);
+        if (last && thread?.status?.type !== "active" && ["completed", "failed", "interrupted"].includes(last.status)) {
+          for (const event of mapCodexNotification("turn/completed", { threadId: agent.id, turn: last }, this.state)) this.emit(event);
+        }
+        this.childHistory.set(agent.id, { fingerprint, items, finished: !activeSubagent(this.state.subagents.get(agent.id)) });
+      } catch {
+        // A live child may not have flushed its history yet. Keep the last known status.
+      }
+    }
   }
 
   handleServerRequest(id, method, params = {}) {
@@ -290,6 +348,8 @@ class CodexSession {
 
   handleExit(detail, signal) {
     this.closed = true;
+    clearTimeout(this.subagentTimer);
+    settleSubagents(this.state, this.cancelRequested ? "cancelled" : "failed").forEach(event => this.emit(event));
     void this.finishTurn([this.cancelRequested ? { type: "turn-cancelled" } : failedWith(crashMessage("codex", detail, { signal }))]);
   }
 
@@ -336,6 +396,8 @@ class CodexSession {
   }
 
   async close() {
+    clearTimeout(this.subagentTimer);
+    settleSubagents(this.state, "cancelled").forEach(event => this.emit(event));
     this.permissions.cancelAll();
     this.questions.cancelAll();
     if (this.turnActive) this.cancelRequested = true;

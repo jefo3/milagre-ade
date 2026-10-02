@@ -46,9 +46,11 @@ class FakeSession {
 
 function harness({ idleMs = 60_000 } = {}) {
   const sent = [];
+  const closedChats = [];
   const created = [];
   const manager = new SessionManager({
     send: (chatId, event) => sent.push({ chatId, event }),
+    onSessionClosed: (chatId) => closedChats.push(chatId),
     createSession: (provider, options) => {
       const session = new FakeSession(provider, options);
       created.push(session);
@@ -57,7 +59,7 @@ function harness({ idleMs = 60_000 } = {}) {
     idleMs,
     batchMs: 20,
   });
-  return { manager, sent, created };
+  return { manager, sent, created, closedChats };
 }
 const request = (chatId, extra = {}) => ({ chatId, provider: "codex", model: "gpt-6-sol", cwd: "/repo", permissionMode: "auto", prompt: "hi", images: [], command: "/bin/codex", ...extra });
 
@@ -72,7 +74,21 @@ test("creates one session per chat and reuses it", async (t) => {
   assert.equal(created[0].options.cwd, "/repo");
   assert.equal(created[0].options.resumeId, "thread-7");
   assert.equal(created[0].options.command, "/bin/codex");
-  assert.deepEqual(created[0].turns[0], { prompt: "hi", images: [], model: "gpt-6-sol", permissionMode: "auto", effort: undefined, ultracode: undefined });
+  assert.deepEqual(created[0].turns[0], { prompt: "hi", images: [], model: "gpt-6-sol", permissionMode: "auto", effort: undefined, ultracode: undefined, fastMode: undefined, replies: undefined });
+});
+
+test("a turn carries the reply style to its session", async (t) => {
+  const { manager, created } = harness();
+  t.after(() => manager.closeAll());
+  await manager.startTurn(request("1", { replies: "concise" }));
+  assert.equal(created[0].turns[0].replies, "concise");
+});
+
+test("a turn carries fast mode to its session", async (t) => {
+  const { manager, created } = harness();
+  t.after(() => manager.closeAll());
+  await manager.startTurn(request("1", { provider: "claude", model: "claude-opus-5-5", fastMode: true }));
+  assert.equal(created[0].turns[0].fastMode, true);
 });
 
 test("keeps chats apart", async (t) => {
@@ -185,6 +201,18 @@ test("closing a chat delivers its final event and pending text, then goes quiet"
     { chatId: "1", event: { type: "text-delta", messageId: "t1", text: "Hi" } },
     { chatId: "1", event: { type: "turn-cancelled" } },
   ]);
+});
+
+test("reports a chat whose session closed or was replaced after a crash", async (t) => {
+  const { manager, created, closedChats } = harness();
+  t.after(() => manager.closeAll());
+  await manager.startTurn(request("1"));
+  await manager.startTurn(request("2"));
+  await manager.closeChat("1");
+  assert.deepEqual(closedChats, ["1"]);
+  created[1].closed = true;
+  await manager.startTurn(request("2"));
+  assert.deepEqual(closedChats, ["1", "2"]);
 });
 
 test("concurrent turns during a replacement share one new session", async (t) => {
@@ -346,4 +374,52 @@ test("a question is sent right after the text before it", async (t) => {
   created[0].emit({ type: "question-request", requestId: "q-1", questions: [] });
   created[0].emit({ type: "question-resolved", requestId: "q-1", outcome: "dismissed" });
   assert.deepEqual(sent.map((item) => item.event.type), ["text-delta", "question-request", "question-resolved"]);
+});
+
+
+test("TLDR changes resume the same chat with new instructions between turns", async (t) => {
+  const { manager, created } = harness();
+  t.after(() => manager.closeAll());
+  await manager.startTurn(request("1"));
+  assert.equal(created[0].options.tldrEnabled, true);
+  created[0].nativeId = "thread-current";
+  await manager.startTurn(request("1", { tldrEnabled: false, resumeId: "thread-stale" }));
+  assert.equal(created.length, 2);
+  assert.equal(created[0].closed, true);
+  assert.equal(created[1].options.resumeId, "thread-current");
+  assert.equal(created[1].options.tldrEnabled, false);
+  await manager.startTurn(request("1", { tldrEnabled: false }));
+  assert.equal(created.length, 2);
+  created[1].nativeId = "thread-current";
+  await manager.startTurn(request("1", { tldrEnabled: true }));
+  assert.equal(created.length, 3);
+  assert.equal(created[2].options.resumeId, "thread-current");
+  assert.equal(created[2].options.tldrEnabled, true);
+});
+
+test("TLDR changes leave a running turn alone and apply once it finishes", async (t) => {
+  const { manager, created } = harness();
+  t.after(() => manager.closeAll());
+  await manager.startTurn(request("1"));
+  created[0].turnActive = true;
+  created[0].nativeId = "thread-current";
+  await manager.startTurn(request("1", { tldrEnabled: false }));
+  assert.equal(created.length, 1);
+  assert.equal(created[0].closed, false);
+  created[0].turnActive = false;
+  await manager.startTurn(request("1", { tldrEnabled: false }));
+  assert.equal(created.length, 2);
+  assert.equal(created[1].options.tldrEnabled, false);
+});
+
+test('background children prevent idle eviction after the parent finishes', async t => {
+ const {manager,created}=harness({idleMs:15});
+ t.after(()=>manager.closeAll());
+ await manager.startTurn(request('1'));
+ created[0].emit({type:'subagent-update',agent:{id:'child',status:'running'}});
+ created[0].emit({type:'turn-completed'});
+ await new Promise(resolve=>setTimeout(resolve,40));
+ assert.equal(created[0].closed,false);
+ created[0].emit({type:'subagent-update',agent:{id:'child',status:'completed'}});
+ await waitUntil(()=>created[0].closed);
 });

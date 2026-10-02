@@ -5,6 +5,8 @@ import type { PermissionMode } from "../model";
 export type ThemePreference = "system" | "light" | "dark";
 /** Whether plan usage reads as the share used or the share left. */
 export type UsageDisplay = "used" | "remaining";
+/** How long Claude's replies run: Concise is Claude Code's own terse output style. */
+export type ClaudeReplies = "concise" | "normal";
 
 export interface AppSettings {
   theme: ThemePreference;
@@ -14,13 +16,24 @@ export interface AppSettings {
   showUsageInSidebar: boolean;
   /** Show a system notification when a chat waits on an approval or question while Milagre is in the background. */
   notifyWhenWaiting: boolean;
+  notifyOnCompletion: boolean;
+  showDockBadge: boolean;
+  /** Keep the Mac from sleeping while an agent works; the screen can still turn off. */
+  keepAwake: boolean;
+  /** The editor that "Open in" uses, by id; empty means the first one found. */
+  editorId: string;
+  /** Applies to Claude only; Codex is unchanged. */
+  claudeReplies: ClaudeReplies;
+  /** Apply TLDR writing rules to both providers. */
+  tldrEnabled: boolean;
 }
 
 const STORAGE_KEY = "milagre-settings";
 const LEGACY_THEME_KEY = "milagre-theme";
 const THEMES: ThemePreference[] = ["system", "light", "dark"];
 const USAGE_DISPLAYS: UsageDisplay[] = ["used", "remaining"];
-const DEFAULTS: AppSettings = { theme: "light", defaultModelId: MODEL_CATALOG[0].id, defaultPermissionMode: "ask", usageDisplay: "used", showUsageInSidebar: true, notifyWhenWaiting: true };
+const CLAUDE_REPLIES: ClaudeReplies[] = ["concise", "normal"];
+const DEFAULTS: AppSettings = { theme: "light", defaultModelId: MODEL_CATALOG[0].id, defaultPermissionMode: "ask", usageDisplay: "used", showUsageInSidebar: true, notifyWhenWaiting: true, notifyOnCompletion: true, showDockBadge: true, keepAwake: true, editorId: "", claudeReplies: "concise", tldrEnabled: true };
 
 function load(): AppSettings {
   try {
@@ -36,6 +49,12 @@ function load(): AppSettings {
       usageDisplay: USAGE_DISPLAYS.includes(saved.usageDisplay as UsageDisplay) ? saved.usageDisplay! : DEFAULTS.usageDisplay,
       showUsageInSidebar: typeof saved.showUsageInSidebar === "boolean" ? saved.showUsageInSidebar : DEFAULTS.showUsageInSidebar,
       notifyWhenWaiting: typeof saved.notifyWhenWaiting === "boolean" ? saved.notifyWhenWaiting : DEFAULTS.notifyWhenWaiting,
+      notifyOnCompletion: typeof saved.notifyOnCompletion === "boolean" ? saved.notifyOnCompletion : DEFAULTS.notifyOnCompletion,
+      showDockBadge: typeof saved.showDockBadge === "boolean" ? saved.showDockBadge : DEFAULTS.showDockBadge,
+      keepAwake: typeof saved.keepAwake === "boolean" ? saved.keepAwake : DEFAULTS.keepAwake,
+      editorId: typeof saved.editorId === "string" ? saved.editorId : DEFAULTS.editorId,
+      tldrEnabled: typeof saved.tldrEnabled === "boolean" ? saved.tldrEnabled : DEFAULTS.tldrEnabled,
+      claudeReplies: CLAUDE_REPLIES.includes(saved.claudeReplies as ClaudeReplies) ? saved.claudeReplies! : DEFAULTS.claudeReplies,
     };
   } catch {
     return DEFAULTS;
@@ -79,6 +98,13 @@ export function useResolvedTheme(): "light" | "dark" {
   const { theme } = useSettings();
   const systemDark = useSyncExternalStore(subscribeSystemTheme, () => darkQuery.matches);
   return theme === "system" ? (systemDark ? "dark" : "light") : theme;
+}
+
+/** ⌘⇧T: flips to the opposite of what's on screen, pinning light or dark even from System. */
+export function toggleTheme() {
+  const { theme } = getSettings();
+  const dark = theme === "system" ? darkQuery.matches : theme === "dark";
+  updateSettings({ theme: dark ? "light" : "dark" });
 }
 
 export function useApplyTheme() {

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   ChatMessage,
   ImageAttachment,
@@ -16,27 +17,43 @@ import {
   AgentModels,
   capabilityFor,
   effortFor,
+  supportsFastMode,
   sessionForWorktree,
   sortedWorktrees,
 } from "./model";
 import { useAgentRuns } from "./components/useAgentRuns";
 import { chatInProject, chatKey, chatsRunning, chatsWaitingForUser, lastUserModel, modelForChat, projectOfKey, sentDecision, sentReply, sessionIdFromKey } from "./lib/agent-runs";
-import { capabilitiesFrom, keepIfSame, mergeModels, nextSelection } from "./lib/models";
+import { attachmentPrompt } from "./lib/media";
+import { capabilitiesFrom, keepIfSame, mergeModels, nextSelection, providerForId, resolveModel } from "./lib/models";
 import { chatMark, chatTitle } from "./lib/chat-list";
 import type { SessionPatch } from "../../electron/shared/project-edits.mjs";
+import { isMilagreWorktree, worktreeShared } from "./lib/archive";
+import { archiveChat as runArchive } from "./lib/archive-flow";
+import type { ArchiveMode, ArchivePlan } from "./lib/archive";
+import { GitActionsDialog } from "./components/GitActionsDialog";
+import { gitChatContext, isGitNote, type GitChatContext } from "./lib/git-dialog";
+import { useWorktreePullRequests } from "./components/useWorktreePullRequests";
 import { usePastedImages } from "./components/usePastedImages";
 import { ChatComposer } from "./components/ChatComposer";
 import { DotBackground } from "./components/DotBackground";
 import SidebarNav from "./components/SidebarNav";
 import { SettingsNav, SettingsPanel } from "./components/Settings";
+import { chatRevealPath } from "./lib/reveal";
 import type { SettingsSection } from "./components/Settings";
-import { getSettings, useApplyTheme, useSettings } from "./lib/settings";
+import { getSettings, toggleTheme, updateSettings, useApplyTheme, useSettings } from "./lib/settings";
+import { EditorLinks, Notice } from "./components/editor-links";
+import { openInEditor } from "./lib/editors";
 import { PermissionCard } from "./components/agents/PermissionCard";
 import { QuestionCard } from "./components/agents/QuestionCard";
 import type { UpdateState } from "./electron";
 import { SidebarUsage } from "./components/usage/SidebarUsage";
 import { visibleProviders } from "./components/usage/format";
 import { useUsage } from "./components/usage/useUsage";
+import { loadChatPreferences, saveChatPreferences } from "./lib/chat-preferences";
+import { CommandPalette } from "./components/CommandPalette";
+import { settingsCommands } from "./lib/settings-commands";
+import type { Command } from "./lib/commands";
+import type { RecentProject } from "./lib/project-list";
 
 // The chat with the most recent message, or none so the app opens on a new chat. Archived chats don't count.
 function latestSessionId(state: CoordinatorState) {
@@ -59,12 +76,16 @@ function App() {
   const openState = () => (projectRef.current ? statesRef.current[projectRef.current.path] : undefined);
   const [selectedWorktreeId, setSelectedWorktreeId] = useState<number | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
+  const selectedSessionRef = useRef<number | null>(null);
+  selectedSessionRef.current = selectedSessionId;
   const [draft, setDraft] = useState("");
-  const [selectedModel, setSelectedModel] = useState<ModelOption>(() => MODEL_CATALOG.find((model) => model.id === getSettings().defaultModelId) ?? MODEL_CATALOG[0]);
+  const [selectedModel, setSelectedModel] = useState<ModelOption>(() => resolveModel(MODEL_CATALOG, getSettings().defaultModelId, providerForId(getSettings().defaultModelId)));
   const [effort, setEffortState] = useState<EffortLevel>(() => (localStorage.getItem("milagre.effort") as EffortLevel | null) ?? "high");
   const setEffort = (level: EffortLevel) => { setEffortState(level); localStorage.setItem("milagre.effort", level); };
   const [ultracode, setUltracodeState] = useState(() => localStorage.getItem("milagre.ultracode") === "on");
   const setUltracode = (on: boolean) => { setUltracodeState(on); localStorage.setItem("milagre.ultracode", on ? "on" : "off"); };
+  const [fastMode, setFastModeState] = useState(() => localStorage.getItem("milagre.fastMode") === "on");
+  const setFastMode = (on: boolean) => { setFastModeState(on); localStorage.setItem("milagre.fastMode", on ? "on" : "off"); };
   // The agents' own model lists; the maintained list stands in until they arrive, and for a missing CLI.
   const [reported, setReported] = useState<AgentModels | null>(null);
   const models = useMemo(() => mergeModels(reported, MODEL_CATALOG), [reported]);
@@ -92,18 +113,36 @@ function App() {
     if (reported !== null) appliedDefault.current = true;
     setSelectedModel((current) => nextSelection(models, current, { defaultId: getSettings().defaultModelId, applyDefault, lockedProvider: lockedProviderRef.current }));
   }, [models]);
-  const chooseModel = (model: ModelOption) => { pickedModel.current = true; setSelectedModel(model); };
+  const chooseModel = (model: ModelOption) => { pickedModel.current = true; setSelectedModel(model); updateSettings({ defaultModelId: model.id }); };
   const selectedCapability = capabilityFor(selectedModel, capabilities);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => getSettings().defaultPermissionMode);
   const [view, setView] = useState<"chat" | "settings">("chat");
-  const [isolation, setIsolation] = useState<Isolation>("local");
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
+  useEffect(() => {
+    if (!commandPaletteOpen) return;
+    let cancelled = false;
+    window.milagre.listRecentProjects().then((projects) => {
+      if (!cancelled) setRecentProjects(projects);
+    }).catch(() => { if (!cancelled) setRecentProjects([]); });
+    return () => { cancelled = true; };
+  }, [commandPaletteOpen]);
+  const [isolation, setIsolation] = useState<Isolation>(() => loadChatPreferences(localStorage, "").isolation);
   const [branches, setBranches] = useState<string[]>([]);
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
   const [newChatError, setNewChatError] = useState<string | null>(null);
+  // A short message about something that happened off to the side (a worktree that wouldn't go).
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 12_000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [preparing, setPreparing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [update, setUpdate] = useState<UpdateState | null>(null);
+  const [gitDialog, setGitDialog] = useState<{ sessionId: number; worktreeId: number; cwd: string; base?: string; provider?: ModelProvider; chat: GitChatContext } | null>(null);
   useApplyTheme();
 
   useEffect(() => {
@@ -120,7 +159,7 @@ function App() {
 
   useEffect(() => {
     window.milagre.getCurrentProject().then((current) => {
-      showProject(current);
+      adoptProject(current);
       setLoading(false);
     });
   }, []);
@@ -140,7 +179,7 @@ function App() {
   const firstWorktree = worktrees[0];
   const selectedSession = state && selectedSessionId !== null ? state.sessions[selectedSessionId] : undefined;
   const selectedWorktree = worktrees.find((worktree) => worktree.id === (selectedSession?.worktree_id ?? selectedWorktreeId)) ?? firstWorktree;
-  const imageDraft = usePastedImages(selectedWorktree?.path ?? project?.path ?? "");
+  const imageDraft = usePastedImages(`${project?.path ?? ""}:${selectedSessionId ?? "new"}:${selectedWorktree?.path ?? ""}`);
   const messages = state && selectedSession ? state.messages.filter((message) => message.session_id === selectedSession.id) : [];
   lockedProviderRef.current = messages.length > 0 ? selectedSession?.provider : undefined;
 
@@ -148,10 +187,27 @@ function App() {
     const latest = statesRef.current[projectOfKey(chatId)];
     return latest ? lastUserModel(latest, sessionIdFromKey(chatId)) : "";
   });
+  const pullRequests = useWorktreePullRequests(project?.path ?? "", state);
   const run = project && selectedSession ? agentRuns.runs[chatKey(project.path, selectedSession.id)] : undefined;
   const isSending = preparing || Boolean(run);
   const usage = useUsage();
-  const { showUsageInSidebar, notifyWhenWaiting } = useSettings();
+  const { showUsageInSidebar, keepAwake, defaultModelId, defaultPermissionMode, notifyOnCompletion, showDockBadge, notifyWhenWaiting } = useSettings();
+
+  // Visiting an old chat can change its displayed model, but never the preference for new chats.
+  useEffect(() => {
+    if (selectedSessionId !== null) return;
+    setSelectedModel(resolveModel(models, defaultModelId, providerForId(defaultModelId)));
+    setPermissionMode(defaultPermissionMode);
+  }, [selectedSessionId, defaultModelId, defaultPermissionMode, models]);
+
+  const effectiveBaseBranch = baseBranch && branches.includes(baseBranch)
+    ? baseBranch : selectedWorktree?.name ?? branches[0] ?? "";
+
+  function restoreProjectChoices(nextState: CoordinatorState, path: string) {
+    const saved = loadChatPreferences(localStorage, path);
+    setSelectedWorktreeId(sortedWorktrees(nextState).find((tree) => tree.path === saved.worktreePath)?.id ?? sortedWorktrees(nextState)[0]?.id ?? null);
+    setBaseBranch(saved.baseBranch ?? null);
+  }
   const runningCount = Object.keys(agentRuns.runs).length;
   const previousRunningCount = useRef(runningCount);
 
@@ -167,6 +223,7 @@ function App() {
   // A running turn takes the new mode at once instead of at its next message.
   function changePermissionMode(mode: PermissionMode) {
     setPermissionMode(mode);
+    updateSettings({ defaultPermissionMode: mode });
     if (project && selectedSession) void window.milagre.setAgentPermissionMode(chatKey(project.path, selectedSession.id), mode).catch(() => {});
   }
 
@@ -208,7 +265,8 @@ function App() {
       .sort((a, b) => (b.sessionMessages.at(-1)?.id ?? 0) - (a.sessionMessages.at(-1)?.id ?? 0))
       .map(({ session, sessionMessages }) => {
         const worktree = state.worktrees[session.worktree_id];
-        const lastReply = [...sessionMessages].reverse().find((message) => message.role === "assistant");
+        // The commit dialog's notes aren't replies: they don't hide a failed turn.
+        const lastReply = [...sessionMessages].reverse().find((message) => message.role === "assistant" && !isGitNote(message));
         return {
           id: String(session.id),
           label: chatTitle(session, sessionMessages),
@@ -218,16 +276,28 @@ function App() {
             branch: worktree?.name,
             path: worktree?.path,
             diff: worktree?.diff,
+            pullRequest: worktree ? pullRequests[worktree.path] ?? undefined : undefined,
             failed: lastReply?.outcome === "failed",
           },
         };
       });
-  }, [state, waiting, running]);
-
+  }, [state, waiting, running, pullRequests]);
   // The main process applies chat row actions to the latest state, so a turn that finished since the last render isn't lost.
   function patchChat(sessionId: number, patch: SessionPatch) {
     const current = projectRef.current;
     if (current) void window.milagre.patchChat(current.path, sessionId, patch).catch(() => {});
+  }
+
+  function archiveChild(id: string, archived: boolean) {
+    const current = projectRef.current;
+    const parentId = selectedSessionRef.current;
+    if (current && parentId !== null) void window.milagre.archiveSubagent(current.path, parentId, id, archived).catch(() => {});
+  }
+
+  function archiveFinishedChildren() {
+    const current = projectRef.current;
+    const parentId = selectedSessionRef.current;
+    if (current && parentId !== null) void window.milagre.archiveFinishedSubagents(current.path, parentId).catch(() => {});
   }
 
   function openChat(sessionId: number) {
@@ -236,74 +306,177 @@ function App() {
     setView("chat");
   }
 
-  // The main process reads the chat on screen, and leaves a chat unread when its turn ends anywhere else.
+  // The main process reads the chat on screen (on opening it, and when the window regains focus over it),
+  // and leaves a chat unread when its turn ends anywhere else, or while no window has focus.
   useEffect(() => {
     void window.milagre.setOpenChat(view === "chat" && project && selectedSessionId !== null ? chatKey(project.path, selectedSessionId) : null).catch(() => {});
   }, [selectedSessionId, view, project?.path]);
 
-  // Archiving hides the chat for good; a turn still running in it is stopped first.
-  function archiveChat(sessionId: number) {
-    if (!project) return;
-    const key = chatKey(project.path, sessionId);
-    if (agentRuns.runs[key]) void agentRuns.interrupt(key).catch(() => {});
-    patchChat(sessionId, { archived: true, unread: false });
-    if (selectedSessionId === sessionId) startNewChat();
+  // Archiving hides the chat for good; a turn still running in it is stopped first. The steps and their order
+  // live in lib/archive-flow.ts, which is passed what it touches.
+  function archiveChat(sessionId: number, mode: ArchiveMode, plan: ArchivePlan | null) {
+    if (!project) return Promise.resolve();
+    const projectPath = project.path;
+    const key = chatKey(projectPath, sessionId);
+    const wasOpen = selectedSessionId === sessionId;
+    return runArchive({
+      projectPath,
+      chatId: key,
+      getState: () => openState() ?? null,
+      currentProjectPath: () => projectRef.current?.path,
+      stop: () => (agentRuns.runs[key] ? agentRuns.interrupt(key).catch(() => {}) : undefined),
+      hide: () => {
+        patchChat(sessionId, { archived: true, unread: false });
+        if (selectedSessionId === sessionId) startNewChat();
+      },
+      // The worktree stays, so the chat comes back with it; it is reopened only if it was open and nothing else has been since.
+      restore: () => {
+        patchChat(sessionId, { archived: false });
+        if (wasOpen && selectedSessionRef.current === null) openChat(sessionId);
+      },
+      remove: (worktree, options) => window.milagre.removeWorktree(worktree.path, options),
+      // The main process has dropped the worktree and its chats; a removal that drops the open chat or the picked
+      // worktree moves the selection on.
+      applyRemoval: (removed) => {
+        setSelectedSessionId((current) => (current !== null && removed.sessionIds.includes(current) ? null : current));
+        setSelectedWorktreeId((current) => (current === removed.worktreeId ? null : current));
+      },
+      refreshBranches: () => void window.milagre.listBranches(projectPath).then(setBranches).catch(() => {}),
+      notify: setNotice,
+    }, sessionId, mode, plan);
+  }
+
+  // What the archive menu offers depends on the chat's worktree: whether Milagre made it, whether another chat
+  // uses it, and what it would lose.
+  async function checkArchive(sessionId: number): Promise<ArchivePlan> {
+    const latest = openState();
+    const worktree = latest ? latest.worktrees[latest.sessions[sessionId]?.worktree_id ?? -1] : undefined;
+    if (!latest || !isMilagreWorktree(worktree, await window.milagre.getWorktreeRoots())) return { milagreOwned: false, shared: false, status: null };
+    if (worktreeShared(latest, sessionId)) return { milagreOwned: true, shared: true, status: null };
+    return { milagreOwned: true, shared: false, status: await window.milagre.getWorktreeStatus(worktree.path, worktree.base!) };
+  }
+
+  // "Commit and open PR…" opens the chat, with the dialog over it.
+  function openGitDialog(sessionId: number) {
+    const latest = openState();
+    const session = latest?.sessions[sessionId];
+    const worktree = session ? latest.worktrees[session.worktree_id] : undefined;
+    if (!latest || !session || !worktree) return;
+    const sessionMessages = latest.messages.filter((message) => message.session_id === sessionId);
+    openChat(sessionId);
+    setGitDialog({ sessionId, worktreeId: worktree.id, cwd: worktree.path, base: worktree.base, provider: session.provider, chat: gitChatContext(chatTitle(session, sessionMessages), sessionMessages) });
+  }
+
+  // What the dialog did goes on record as a short line in the chat; the main process holds it back while the
+  // chat's turn runs, so it lands after the reply instead of inside it.
+  function recordGitNote(sessionId: number, body: string) {
+    const current = projectRef.current;
+    if (current) void window.milagre.addGitNote(chatKey(current.path, sessionId), body).catch(() => {});
   }
 
   function revealChat(sessionId: number) {
+    if (!project) return;
+    void window.milagre.revealInFolder(chatRevealPath(openState() ?? null, sessionId, project.path)).catch(() => {});
+  }
+
+  function openChatInEditor(sessionId: number) {
     const latest = openState();
     const worktree = latest?.worktrees[latest.sessions[sessionId]?.worktree_id ?? -1];
-    if (worktree) void window.milagre.revealWorktree(worktree.path).catch(() => {});
+    if (worktree) void openInEditor(worktree.path);
   }
+
+  // The main process keeps the Mac awake while a turn runs, if the setting says so.
+  useEffect(() => { void window.milagre.setKeepAwake(keepAwake).catch(() => {}); }, [keepAwake]);
+
+  const unreadChatIds = state && project ? Object.values(state.sessions).filter(session => session.unread && !session.archived).map(session => chatKey(project.path, session.id)) : [];
+  useEffect(() => {
+    if (!project) return;
+    void window.milagre.syncNotifications({ projectPath: project.path, activeChatId: view === "chat" && selectedSessionId !== null ? chatKey(project.path, selectedSessionId) : null, unread: unreadChatIds, notifyOnCompletion, showDockBadge }).catch(() => {});
+  }, [project?.path, view, selectedSessionId, JSON.stringify(unreadChatIds), notifyOnCompletion, showDockBadge]);
 
   // The main process notifies about a chat that waits on the user while Milagre is in the background.
   useEffect(() => {
     void window.milagre.setNotifyWhenWaiting(notifyWhenWaiting).catch(() => {});
   }, [notifyWhenWaiting]);
 
+  // A turn that ends in the open project while Milagre is in the background gets a completion alert.
+  useEffect(() => window.milagre.onAgentEvent(({ chatId, event }) => {
+    const current = projectRef.current;
+    const latest = openState();
+    if (!current || !latest || !chatInProject(current.path, chatId)) return;
+    const session = latest.sessions[sessionIdFromKey(chatId)];
+    if (!session || session.archived) return;
+    if (event.type === "turn-completed" || event.type === "turn-failed") {
+      void window.milagre.notifyCompletion({ chatId, title: current.name, subtitle: chatTitle(session, latest.messages.filter((message) => message.session_id === session.id)) }).catch(() => {});
+    }
+  }), []);
+
   // A new worktree's branch is renamed a few seconds in, once its chat's name is picked; the main process saves the new name.
   useEffect(() => window.milagre.onWorktreeRenamed((rename) => {
     if (projectRef.current?.path === rename.projectPath) void window.milagre.listBranches(rename.projectPath).then(setBranches);
   }), []);
 
+  const pendingNotificationChat = useRef<string | null>(null);
   // Clicking a notification opens its chat, in another project too.
-  useEffect(() => window.milagre.onOpenChat(async (chatId) => {
+  useEffect(() => window.milagre.onOpenChat((chatId) => {
     const current = projectRef.current;
-    if (current && !chatInProject(current.path, chatId)) {
-      const other = await window.milagre.readProject(projectOfKey(chatId)).catch(() => null);
-      if (!other) return;
-      showProject(other);
-    }
-    const session = openState()?.sessions[sessionIdFromKey(chatId)];
-    if (session) openChat(session.id);
+    const session = current && chatInProject(current.path, chatId) ? openState()?.sessions[sessionIdFromKey(chatId)] : undefined;
+    if (session) { openChat(session.id); return; }
+    const separator = chatId.lastIndexOf("#");
+    if (separator <= 0) return;
+    pendingNotificationChat.current = chatId;
+    void switchProject(chatId.slice(0, separator));
   }), []);
 
   function startNewChat() {
+    const latest = openState();
+    if (latest && projectRef.current) restoreProjectChoices(latest, projectRef.current.path);
     setSelectedSessionId(null);
     setDraft("");
     setNewChatError(null);
     setView("chat");
+    // The composer may only mount on this render (coming from settings), so focus after it lands.
+    window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Prompt"]')?.focus());
   }
 
-  function selectInitialChat(nextState: CoordinatorState) {
-    const sessionId = latestSessionId(nextState);
+  function selectInitialChat(nextState: CoordinatorState, path: string) {
+    restoreProjectChoices(nextState, path);
+    const target = pendingNotificationChat.current;
+    const targetId = target && chatInProject(path, target) ? sessionIdFromKey(target) : null;
+    const sessionId = targetId !== null && nextState.sessions[targetId] ? targetId : latestSessionId(nextState);
+    pendingNotificationChat.current = null;
     setSelectedSessionId(sessionId);
-    setSelectedWorktreeId(sessionId !== null ? nextState.sessions[sessionId]?.worktree_id ?? null : sortedWorktrees(nextState)[0]?.id ?? null);
+    if (sessionId !== null) setSelectedWorktreeId(nextState.sessions[sessionId]?.worktree_id ?? null);
   }
 
   // Switching projects leaves the other project's turns running; their marks come back with it.
-  function showProject(next: OpenProject) {
-    receiveState(next.path, next.state);
-    projectRef.current = next;
-    setProject(next);
-    selectInitialChat(next.state);
-    setDraft("");
+  function adoptProject(nextProject: OpenProject) {
+    receiveState(nextProject.path, nextProject.state);
+    projectRef.current = nextProject;
+    // The project's remembered worktree and base branch come back with it; nothing about the old project's chats
+    // carries over, the commit dialog included (it names a chat by id, and every project has a chat 2).
+    flushSync(() => {
+      setProject(nextProject);
+      selectInitialChat(nextProject.state, nextProject.path);
+      setDraft("");
+      setGitDialog(null);
+      setView("chat");
+    });
   }
 
-  async function openProject() {
-    const nextProject = await window.milagre.openProject();
-    if (nextProject) showProject(nextProject);
+  // Opens a project in place of the one shown; a cancelled dialog, or the project already open, changes nothing.
+  async function replaceProject(load: () => Promise<OpenProject | null>) {
+    try {
+      const next = await load();
+      if (next && next.path !== projectRef.current?.path) adoptProject(next);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setNotice(message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ""));
+    }
   }
+
+  const openProject = () => replaceProject(() => window.milagre.openProject());
+  const switchProject = (projectPath: string) => replaceProject(() => window.milagre.switchProject(projectPath));
 
   // Where a message goes: an open chat keeps its session, a new local chat (session null) gets one
   // from the main process, and a new chat in "New worktree" isolation gets its own worktree first.
@@ -311,19 +484,19 @@ function App() {
     if (!state || !project || !selectedWorktree) return null;
     if (selectedSession) return { sessionId: selectedSession.id as number | null, worktreeId: selectedWorktree.id };
     if (isolation === "local") return { sessionId: null, worktreeId: selectedWorktree.id };
-    const created = await window.milagre.createWorktree({ projectPath: project.path, baseBranch: baseBranch ?? selectedWorktree.name, prompt: body });
+    setBaseBranch(effectiveBaseBranch);
+    saveChatPreferences(localStorage, project.path, { baseBranch: effectiveBaseBranch });
+    const created = await window.milagre.createWorktree({ projectPath: project.path, baseBranch: effectiveBaseBranch, prompt: body });
     const session = sessionForWorktree(created.project.state, created.worktreeId);
     if (!session) throw new Error(`No chat session was created for ${created.project.state.worktrees[created.worktreeId]?.name}.`);
-    setIsolation("local");
-    setBaseBranch(null);
     void window.milagre.listBranches(project.path).then(setBranches);
     return { sessionId: session.id as number | null, worktreeId: created.worktreeId };
   }
 
   const ipcError = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/^Error invoking remote method '[^']+': (Error: )?/, "");
 
-  async function executeSend(body: string, mode: PermissionMode, images: ImageAttachment[] = imageDraft.images) {
-    if ((!body && !images.length) || !state || !selectedWorktree || !project || preparing || imageDraft.loading) return;
+  async function executeSend(body: string, mode: PermissionMode, images: ImageAttachment[] = imageDraft.images, files: string[] = imageDraft.files) {
+    if ((!body && !images.length && !files.length) || !state || !selectedWorktree || !project || preparing || imageDraft.loading) return;
     setPreparing(true);
     setNewChatError(null);
 
@@ -350,11 +523,16 @@ function App() {
         worktreeId: target.worktreeId,
         body,
         images,
+        files,
+        prompt: attachmentPrompt(body, files),
         provider: model.provider,
         model: model.id,
         permissionMode: mode,
         effort: effortFor(capabilityFor(model, capabilities), effort),
         ultracode: capabilityFor(model, capabilities).ultracode && ultracode,
+        fastMode: supportsFastMode(model) && fastMode,
+        replies: getSettings().claudeReplies,
+        tldrEnabled: getSettings().tldrEnabled,
       });
       if (projectRef.current?.path === project.path) {
         setSelectedSessionId(sessionId);
@@ -371,14 +549,31 @@ function App() {
 
   async function sendMessage() {
     const body = draft.trim();
-    if ((!body && !imageDraft.images.length) || !state || !selectedWorktree || !project || preparing || imageDraft.loading) return;
+    if ((!body && !imageDraft.images.length && !imageDraft.files.length) || !state || !selectedWorktree || !project || preparing || imageDraft.loading) return;
     await executeSend(body, permissionMode);
   }
 
+  // Keep finished message cards out of the typing render path. Recommendations still use
+  // the current model and permission mode when clicked.
+  const recommendationRef = useRef<(option: string) => void>(() => {});
+  recommendationRef.current = (option) => { void executeSend(option, permissionMode); };
+  const sendRecommendation = useCallback((option: string) => recommendationRef.current(option), []);
+
   useEffect(() => {
     function handleShortcut(event: KeyboardEvent) {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
-      if (event.key === ",") {
+      if (event.defaultPrevented || event.isComposing || document.querySelector('[role="dialog"], dialog[open]')) return;
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      if (event.shiftKey) {
+        if (event.key.toLowerCase() === "t") {
+          event.preventDefault();
+          toggleTheme();
+        }
+        return;
+      }
+      if (event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+      } else if (event.key === ",") {
         event.preventDefault();
         setView("settings");
       } else if (event.key.toLowerCase() === "n") {
@@ -418,9 +613,55 @@ function App() {
     return () => window.removeEventListener("keydown", handleEscape);
   }, [run, project?.path, selectedSession?.id, view]);
 
+  useEffect(() => {
+    function jumpToChat(event: KeyboardEvent) {
+      if (view !== "chat" || event.defaultPrevented || event.isComposing || event.altKey || event.shiftKey) return;
+      if (!(event.metaKey || event.ctrlKey) || !/^[1-9]$/.test(event.key)) return;
+      if (document.querySelector('dialog[open], [role="dialog"], [role="menu"], [aria-label="Chat name"]')) return;
+      const chat = chats[Number(event.key) - 1];
+      if (!chat) return;
+      event.preventDefault();
+      openChat(Number(chat.id));
+    }
+    window.addEventListener("keydown", jumpToChat);
+    return () => window.removeEventListener("keydown", jumpToChat);
+  }, [chats, view]);
+
   if (loading || !project || !state) {
     return <div className="grid h-screen place-items-center overflow-hidden bg-page text-sm text-ink-3">Loading workspace…</div>;
   }
+
+  const modifier = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
+  const commands: Command[] = [
+    { id: "new-chat", label: "New chat", group: "Actions", icon: "add", shortcut: `${modifier}N`, keywords: "create agent session", run: startNewChat },
+    { id: "open-project", label: "Open project…", group: "Actions", icon: "folder", shortcut: `${modifier}O`, keywords: "add repository workspace folder", run: () => openProject() },
+    { id: "settings", label: "Settings", group: "Actions", icon: "settings", shortcut: `${modifier},`, keywords: "preferences model permissions", run: () => { setSettingsSection("general"); setView("settings"); } },
+    { id: "appearance", label: "Appearance settings", group: "Actions", icon: "settings", keywords: "theme preferences", run: () => { setSettingsSection("appearance"); setView("settings"); } },
+    { id: "toggle-theme", label: "Toggle theme", group: "Actions", icon: "settings", shortcut: modifier === "⌘" ? "⌘⇧T" : "Ctrl+Shift+T", keywords: "appearance switch color mode", run: toggleTheme },
+    { id: "project-settings", label: "Project settings", group: "Actions", icon: "settings", detail: project.name, keywords: "worktree setup files", run: () => { setSettingsSection("project"); setView("settings"); } },
+  ];
+  if (view === "settings") commands.push({ id: "back-to-chat", label: "Back to chat", group: "Actions", icon: "chat", run: () => setView("chat") });
+  commands.push(...settingsCommands(getSettings(), updateSettings));
+  if (selectedSession && view === "chat") {
+    const sessionId = selectedSession.id;
+    commands.unshift(
+      { id: "git", label: "Commit and open PR…", group: "Current chat", icon: "git", keywords: "git changes pull request push", run: () => openGitDialog(sessionId) },
+      { id: "editor", label: "Open in editor", group: "Current chat", icon: "editor", keywords: "code vscode cursor", run: () => openChatInEditor(sessionId) },
+      { id: "reveal", label: "Reveal folder", group: "Current chat", icon: "folder", keywords: "finder explorer worktree", run: () => revealChat(sessionId) },
+      { id: "unread", label: selectedSession.unread ? "Mark as read" : "Mark as unread", group: "Current chat", icon: "unread", run: () => patchChat(sessionId, { unread: !selectedSession.unread }) },
+    );
+    if (selectedWorktree) commands.splice(3, 0, { id: "copy-path", label: "Copy worktree path", group: "Current chat", icon: "copy", run: () => navigator.clipboard.writeText(selectedWorktree.path) });
+  }
+  commands.push(...chats.map((chat): Command => ({
+    id: `chat:${chat.id}`, label: chat.label, group: "Chats", icon: "chat",
+    detail: [chat.mark === "waiting" ? "Needs you" : chat.mark === "running" ? "Working" : chat.unread ? "Unread" : "", chat.details.branch].filter(Boolean).join(" · "),
+    keywords: [chat.details.path, chat.details.pullRequest?.title, chat.details.pullRequest ? `#${chat.details.pullRequest.number}` : ""].filter(Boolean).join(" "),
+    run: () => openChat(Number(chat.id)),
+  })));
+  commands.push(...recentProjects.filter((recent) => recent.path !== project.path).map((recent): Command => ({
+    id: `project:${recent.path}`, label: recent.name, group: "Projects", icon: "folder", detail: recent.path,
+    run: () => switchProject(recent.path),
+  })));
 
   return (
     <DotBackground>
@@ -431,6 +672,12 @@ function App() {
           <button className="rounded-lg bg-blue-600 px-3 py-1.5 font-medium text-white hover:bg-blue-700" onClick={() => void window.milagre.installUpdate()}>
             Atualizar e reiniciar
           </button>
+        </div>
+      )}
+      {notice && (
+        <div role="status" data-notice className="fixed inset-x-4 bottom-4 z-[80] mx-auto flex max-w-[520px] items-start gap-3 rounded-[12px] bg-surface px-4 py-3 text-[13px] leading-snug text-ink shadow-overlay [-webkit-app-region:no-drag]">
+          <span className="min-w-0 flex-1 break-words">{notice}</span>
+          <button type="button" onClick={() => setNotice(null)} className="shrink-0 font-medium text-ink-3 hover:text-ink">Dismiss</button>
         </div>
       )}
       <div className="flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden text-ink">
@@ -448,22 +695,31 @@ function App() {
           onRename: (id, title) => patchChat(Number(id), { title }),
           onMarkUnread: (id, unread) => patchChat(Number(id), { unread }),
           onReveal: (id) => revealChat(Number(id)),
-          onArchive: (id) => archiveChat(Number(id)),
+          onOpenInEditor: (id) => openChatInEditor(Number(id)),
+          onCommit: (id) => openGitDialog(Number(id)),
+          onArchiveCheck: (id) => checkArchive(Number(id)),
+          onArchive: (id, mode, plan) => void archiveChat(Number(id), mode, plan),
         }}
         onNewChat={startNewChat}
         onOpenSettings={() => setView("settings")}
+        onOpenCommands={() => setCommandPaletteOpen(true)}
+        hintsEnabled={view === "chat" && !commandPaletteOpen && !gitDialog}
+        projectPath={project.path}
+        onSwitchProject={(path) => void switchProject(path)}
+        onOpenProjectSettings={() => { setSettingsSection("project"); setView("settings"); }}
         usage={showUsageInSidebar && usage.snapshot && visibleProviders(usage.snapshot).length > 0 ? <SidebarUsage usage={usage} /> : undefined}
       />
       </div>
       {view === "settings" && (
         <div className="flex shrink-0 py-3 pl-3">
-          <SettingsNav section={settingsSection} onSelect={setSettingsSection} onBack={() => setView("chat")} />
+          <SettingsNav section={settingsSection} projectName={project.name} onSelect={setSettingsSection} onBack={() => setView("chat")} />
         </div>
       )}
 
       <main className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent pr-3 pb-3">
-        {view === "settings" && <SettingsPanel section={settingsSection} models={models} />}
+        {view === "settings" && <SettingsPanel section={settingsSection} projectPath={project.path} models={models} />}
         <div className={`min-h-0 flex-1 overflow-hidden ${view === "chat" ? "" : "hidden"}`}>
+          <EditorLinks root={selectedWorktree?.path ?? project.path}>
           <ChatComposer
             key={project.path}
             messages={messages}
@@ -476,6 +732,10 @@ function App() {
             sendBlocked={preparing}
             streamingText={run?.text}
             streamingSteps={run?.steps}
+            subagents={selectedSession?.subagents}
+            onArchiveFinishedSubagents={archiveFinishedChildren}
+            onArchiveSubagent={archiveChild}
+            waitingForSubagents={run?.waitingForSubagents}
             waitingStepIds={run?.approvals.flatMap((request) => (request.stepId ? [request.stepId] : []))}
             runModelName={run ? models.find((model) => model.id === run.model)?.name ?? run.model : undefined}
             lockedProvider={messages.length > 0 ? selectedSession?.provider : undefined}
@@ -489,17 +749,22 @@ function App() {
             onEffortChange={setEffort}
             ultracode={selectedCapability.ultracode && ultracode}
             onUltracodeChange={setUltracode}
+            fastMode={fastMode}
+            onFastModeChange={setFastMode}
             permissionMode={permissionMode}
             onPermissionModeChange={changePermissionMode}
-            onRecommendationSelect={(option) => void executeSend(option, permissionMode)}
+            onRecommendationSelect={sendRecommendation}
             worktrees={worktrees.map((worktree) => ({ id: worktree.id, name: worktree.name, path: worktree.path }))}
             selectedWorktreeId={selectedWorktree?.id}
-            onWorktreeChange={setSelectedWorktreeId}
+            onWorktreeChange={(id) => {
+              setSelectedWorktreeId(id);
+              saveChatPreferences(localStorage, project.path, { worktreePath: state.worktrees[id]?.path });
+            }}
             isolation={isolation}
-            onIsolationChange={(next) => { setIsolation(next); setNewChatError(null); }}
+            onIsolationChange={(next) => { setIsolation(next); saveChatPreferences(localStorage, project.path, { isolation: next }); setNewChatError(null); }}
             branches={branches}
-            baseBranch={baseBranch ?? selectedWorktree?.name ?? branches[0] ?? ""}
-            onBaseBranchChange={setBaseBranch}
+            baseBranch={effectiveBaseBranch}
+            onBaseBranchChange={(branch) => { setBaseBranch(branch); saveChatPreferences(localStorage, project.path, { baseBranch: branch }); }}
             newChatError={newChatError}
             approval={pendingApproval ? (
               <PermissionCard
@@ -519,9 +784,35 @@ function App() {
               />
             ) : undefined}
           />
+          </EditorLinks>
         </div>
       </main>
       </div>
+      {commandPaletteOpen && <CommandPalette commands={commands} onClose={() => setCommandPaletteOpen(false)} onError={setNotice} />}
+      {gitDialog && (
+        <GitActionsDialog
+          key={gitDialog.sessionId}
+          cwd={gitDialog.cwd}
+          base={gitDialog.base}
+          provider={gitDialog.provider}
+          chat={gitDialog.chat}
+          turnRunning={Boolean(agentRuns.runs[chatKey(project.path, gitDialog.sessionId)])}
+          onClose={() => setGitDialog(null)}
+          // The dialog's chat is the open one; a message sent while its turn runs steers it.
+          onSendToAgent={(text) => {
+            if (selectedSession?.id === gitDialog.sessionId) void executeSend(text, permissionMode, []);
+            else {
+              openChat(gitDialog.sessionId);
+              setDraft(text);
+            }
+          }}
+          onRan={(note) => {
+            recordGitNote(gitDialog.sessionId, note);
+            void window.milagre.refreshDiffs(project.path, [gitDialog.worktreeId]).catch(() => {});
+          }}
+        />
+      )}
+      <Notice />
     </DotBackground>
   );
 }

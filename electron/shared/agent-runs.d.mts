@@ -17,6 +17,8 @@ export interface AgentRun {
   answered: Record<string, SentAnswer>;
   /** A steering message split the reply, so a turn that ends with nothing more to show saves nothing more. */
   split?: boolean;
+  /** The agent waits on its subagents, so the indicator says so instead of "Working". */
+  waitingForSubagents?: boolean;
 }
 
 export type AgentRuns = Record<string, AgentRun>;

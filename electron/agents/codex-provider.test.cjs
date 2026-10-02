@@ -12,11 +12,12 @@ const { waitUntil } = require("./test-helpers.cjs");
 const FAKE = path.join(__dirname, "fixtures", "fake-app-server.cjs");
 const TURN = { prompt: "Hi", images: [], model: "gpt-6-sol", permissionMode: "auto" };
 
-function codex(t, { scenario = "reply", resumeId, command = process.execPath, interruptGraceMs } = {}) {
+function codex(t, { scenario = "reply", resumeId, tldrEnabled, command = process.execPath, interruptGraceMs } = {}) {
   const events = [];
   const session = new CodexSession({
     cwd: os.tmpdir(),
     resumeId,
+    tldrEnabled,
     command,
     clientVersion: "test",
     interruptGraceMs,
@@ -413,7 +414,7 @@ test("commands, reasoning and file changes become steps, in order with the reply
     { type: "step-output", id: "exec-1", text: "ok 2\n" },
     { type: "step-completed", id: "exec-1", status: "done", detail: "$ npm test\nok 1\nok 2\n" },
     { type: "step-started", step: { id: "rs-1", kind: "thinking", title: "Thinking" } },
-    { type: "step-started", step: { id: "exec-2", kind: "edit", title: "Created `notes.txt`" } },
+    { type: "step-started", step: { id: "exec-2", kind: "edit", title: "Created `notes.txt`", file: "/repo/notes.txt" } },
     { type: "step-completed", id: "exec-2", status: "done", title: "Created `notes.txt`", detail: "--- /repo/notes.txt\n+hello\n" },
     { type: "text-delta", messageId: "turn-1", text: "Done" },
     { type: "turn-completed" },
@@ -541,9 +542,9 @@ test("a Codex whose token expired mid-session closes its session, so the next me
   const { session, events } = codex(t, { scenario: "unauthorized" });
   await session.startTurn(TURN);
   await ended(events);
-  await waitUntil(() => session.closed);
+  // closed flips when close() starts; the app-server's exit lands once the kill completes.
+  await waitUntil(() => session.closed && session.rpc.exited);
   assert.deepEqual(events.at(-1), failedWith(loginMessage("codex"), { login: true }));
-  assert.equal(session.rpc.exited, true);
 });
 
 test("a 401 on a provider that needs no OpenAI login keeps Codex's own error and the session", async (t) => {
@@ -583,4 +584,51 @@ test("a crashed Codex's failure is one of Milagre's own messages", async (t) => 
   await session.startTurn(TURN);
   await ended(events);
   assert.equal(events.at(-1).notice, true);
+});
+
+
+test("TLDR can be disabled when starting or resuming Codex", async (t) => {
+  for (const resumeId of [undefined, "thread-existing"]) {
+    const { session, events } = codex(t, { tldrEnabled: false, resumeId });
+    await session.startTurn(TURN);
+    await ended(events);
+    const calls = await received(session);
+    const params = calls.find((call) => call.method === (resumeId ? "thread/resume" : "thread/start")).params;
+    assert.ok(!params.developerInstructions.includes("# tldr eval"));
+    assert.match(params.developerInstructions, /TLDR.*disabled/);
+  }
+});
+
+test('reads child history without resuming it and keeps child completion separate from parent', async () => {
+ const events=[];
+ const session=new CodexSession({emit:e=>events.push(e)});
+ session.state.threadId='parent';
+ session.state.subagents=new Map([['child',{id:'child',title:'Review',status:'running',startedAt:1,updatedAt:1,transcript:[]}]]);
+ session.rpc={request:async(method,params)=>{
+  assert.equal(method,'thread/read');
+  assert.deepEqual(params,{threadId:'child',includeTurns:true});
+  return {thread:{id:'child',turns:[{id:'child-turn',status:'completed',items:[{type:'agentMessage',id:'answer',text:'Review finished'}]}]}};
+ }};
+ await session.refreshSubagents();
+ assert.equal(events.some(e=>e.type==='turn-completed'),false);
+ const child=events.filter(e=>e.type==='subagent-update').at(-1).agent;
+ assert.equal(child.status,'completed');
+ assert.equal(child.transcript[0].text,'Review finished');
+});
+
+test('child history falls back to paginated threads when full reads are rejected', async () => {
+ const events=[];
+ const session=new CodexSession({emit:e=>events.push(e)});
+ session.state.threadId='parent';
+ session.state.subagents=new Map([['child',{id:'child',title:'Review',status:'running',startedAt:1,updatedAt:1,transcript:[]}]]);
+ session.rpc={request:async(method,params)=>{
+  if(method==='thread/read' && params.includeTurns) throw Object.assign(new Error('paginated history'),{rpcError:true});
+  if(method==='thread/read') return {thread:{id:'child',status:{type:'idle'}}};
+  assert.equal(method,'thread/turns/list');
+  assert.equal(params.itemsView,'full');
+  assert.equal(params.sortDirection,'desc');
+  return {data:[{id:'t',status:'completed',items:[{id:'m',type:'agentMessage',text:'Paged result'}]}],nextCursor:null};
+ }};
+ await session.refreshSubagents();
+ assert.equal(events.filter(e=>e.type==='subagent-update').at(-1)?.agent.transcript[0].text,'Paged result');
 });

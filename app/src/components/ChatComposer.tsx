@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { SubagentTrack } from "./agents/SubagentTrack";
+import type { Subagent } from "../model";
+import { memo, useEffect, useState } from "react";
 import type { ComponentProps, DragEvent, ReactNode } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
@@ -13,7 +15,7 @@ import {
   LaptopIcon,
 } from "@hugeicons/core-free-icons";
 import type { AgentCliStatus, EffortLevel, ModelCapability, AgentSession, ChatMessage as AppChatMessage, ChatStep, Isolation, ModelOption, ModelProvider, PermissionMode } from "../model";
-import { isAttachableImage, MAX_IMAGES } from "./usePastedImages";
+import { Attachments } from "./Attachments";
 import type { ImageDraft } from "./usePastedImages";
 import { PromptComposer } from "./PromptComposer";
 import { PickerPanel, PickerRow } from "./primitives/Picker";
@@ -44,7 +46,7 @@ function ReplyContent({ body, steps, streaming, waitingStepIds }: { body: string
   );
 }
 
-function MessageSection({
+const MessageSection = memo(function MessageSection({
   message,
   isUser,
   onRecommendationSelect,
@@ -69,7 +71,7 @@ function MessageSection({
       style={{ animation: "fade-up 400ms cubic-bezier(0.23,1,0.32,1) both" }}
     >
       <div className={`min-w-0 max-w-full text-[13px] leading-[1.55] text-ink ${isUser ? "rounded-xl bg-field px-3 py-1.5" : ""}`}>
-        {message.images && message.images.length > 0 && <div className="mb-2 flex flex-wrap gap-2">{message.images.map((image) => <a key={image.id} href={image.dataUrl} target="_blank" rel="noreferrer" title={image.name} className="rounded-lg border border-line bg-inset p-1"><img src={image.dataUrl} alt={image.name} className="size-20 rounded object-contain" /></a>)}</div>}
+        <Attachments images={message.images} files={message.files} />
         {isUser ? (
           <p className="break-words whitespace-pre-wrap [overflow-wrap:anywhere]">{message.body}</p>
         ) : recommendation ? (
@@ -85,7 +87,7 @@ function MessageSection({
       </div>
     </article>
   );
-}
+});
 
 interface ChatComposerProps {
   imageDraft: ImageDraft;
@@ -100,6 +102,10 @@ interface ChatComposerProps {
   streamingText?: string;
   /** The running turn's tool steps, where they happened in `streamingText`. */
   streamingSteps?: ChatStep[];
+  subagents?: Subagent[];
+  onArchiveFinishedSubagents?: () => void;
+  onArchiveSubagent?: (id: string, archived: boolean) => void;
+  waitingForSubagents?: boolean;
   /** Steps of the running turn whose approval card is open. */
   waitingStepIds?: string[];
   /** The model the open chat's running turn uses; the picker may already show another. */
@@ -118,6 +124,8 @@ interface ChatComposerProps {
   onEffortChange: (effort: EffortLevel) => void;
   ultracode: boolean;
   onUltracodeChange: (on: boolean) => void;
+  fastMode: boolean;
+  onFastModeChange: (on: boolean) => void;
   permissionMode: PermissionMode;
   onPermissionModeChange: (mode: PermissionMode) => void;
   onRecommendationSelect: (option: string) => void;
@@ -215,7 +223,6 @@ function NewChatHeader({ worktrees, selectedWorktreeId, onWorktreeChange, isolat
               style={popoverStyle}
               onKeyDown={(event) => {
                 if (event.key === "Escape") { event.preventDefault(); close(); }
-                if (event.key === "Enter" && branchRows[0]) { branchRows[0].choose(); close(); }
               }}
             >
               {branchRows.map((row) => (
@@ -240,6 +247,10 @@ export function ChatComposer({
   sendBlocked,
   streamingText,
   streamingSteps,
+  subagents = [],
+  onArchiveFinishedSubagents,
+  onArchiveSubagent,
+  waitingForSubagents = false,
   waitingStepIds,
   runModelName,
   lockedProvider,
@@ -253,6 +264,8 @@ export function ChatComposer({
   onEffortChange,
   ultracode,
   onUltracodeChange,
+  fastMode,
+  onFastModeChange,
   permissionMode,
   onPermissionModeChange,
   onRecommendationSelect,
@@ -267,10 +280,11 @@ export function ChatComposer({
   onBaseBranchChange,
   newChatError,
 }: ChatComposerProps) {
-  const isNewChat = messages.length === 0 && !isSending;
+  // Preparing a worktree is not a conversation yet. Move the composer only
+  // when the first message is committed and its draft is cleared together.
+  const isNewChat = messages.length === 0;
   const workingModelName = runModelName ?? selectedModel.name;
   const [scrolled, setScrolled] = useState(false);
-  const [dropError, setDropError] = useState("");
   useEffect(() => {
     if (isNewChat) setScrolled(false);
   }, [isNewChat]);
@@ -279,28 +293,7 @@ export function ChatComposer({
     const files = Array.from(event.dataTransfer.files);
     if (!files.length) return;
     event.preventDefault();
-    setDropError("");
-
-    const imageSlots = Math.max(0, MAX_IMAGES - imageDraft.images.length);
-    const images: File[] = [];
-    const pathFiles: File[] = [];
-    for (const file of files) {
-      if (isAttachableImage(file) && images.length < imageSlots) images.push(file);
-      else pathFiles.push(file);
-    }
-    void imageDraft.addFiles(images);
-
-    const paths: string[] = [];
-    for (const file of pathFiles) {
-      try {
-        const path = window.milagre.getPathForFile(file);
-        if (path) paths.push(path);
-        else setDropError("Could not get a local path for one or more dropped files.");
-      } catch {
-        setDropError("Could not get a local path for one or more dropped files.");
-      }
-    }
-    if (paths.length) onDraftChange(draft ? `${draft.trimEnd()}\n${paths.join("\n")}` : paths.join("\n"));
+    void imageDraft.attachFiles(files);
     event.currentTarget.querySelector<HTMLTextAreaElement>('textarea[aria-label="Prompt"]')?.focus();
   }
 
@@ -323,7 +316,7 @@ export function ChatComposer({
         autoScrollKey={`${messages.length}-${isSending}-${streamingText?.length ?? 0}-${streamingSteps?.length ?? 0}`}
         viewportProps={{ onScroll: (event) => setScrolled(event.currentTarget.scrollTop > 4) }}
       >
-        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-3 px-3 pt-12 pb-4">
+        <div className="chat-column mx-auto flex min-h-full w-full max-w-3xl flex-col gap-3 px-3 pt-12 pb-4">
           {messages.map((message) => (
             <MessageSection
               key={message.id}
@@ -344,11 +337,12 @@ export function ChatComposer({
           ) : null}
           {isSending && (
             <div className="w-full" style={{ animation: "fade-up 400ms cubic-bezier(0.23,1,0.32,1) both" }}>
-              <ThinkingIndicator label={`Working with ${workingModelName}`} />
+              <ThinkingIndicator label={waitingForSubagents ? "Waiting on subagents" : `Working with ${workingModelName}`} />
             </div>
           )}
         </div>
       </MessageScroller>}
+      <SubagentTrack key={messages[0]?.session_id ?? "new"} agents={subagents} provider={lockedProvider ?? selectedModel.provider} onArchiveFinished={onArchiveFinishedSubagents} onArchive={onArchiveSubagent} />
 
       <div className={`mx-auto w-full max-w-3xl shrink-0 p-1.5 ${isNewChat ? "" : "mt-auto"}`}>
         {isNewChat && <NewChatHeader worktrees={worktrees} selectedWorktreeId={selectedWorktreeId} onWorktreeChange={onWorktreeChange} isolation={isolation} onIsolationChange={onIsolationChange} branches={branches} baseBranch={baseBranch} onBaseBranchChange={onBaseBranchChange} />}
@@ -372,11 +366,12 @@ export function ChatComposer({
           onEffortChange={onEffortChange}
           ultracode={ultracode}
           onUltracodeChange={onUltracodeChange}
+          fastMode={fastMode}
+          onFastModeChange={onFastModeChange}
           permissionMode={permissionMode}
           onPermissionModeChange={onPermissionModeChange}
           alwaysExpanded={isNewChat}
         />
-        {dropError && <p role="alert" className="mt-2 px-1 text-[12px] text-red">{dropError}</p>}
         {isNewChat && newChatError && <p role="alert" className="mt-2 px-1 text-[12px] text-red">{newChatError}</p>}
       </div>
     </div>

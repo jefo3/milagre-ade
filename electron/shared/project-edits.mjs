@@ -40,3 +40,20 @@ export function renameWorktree(state, { path, from, name }) {
   ]));
   return { ...state, worktrees: { ...state.worktrees, [worktree.id]: { ...worktree, name } }, sessions };
 }
+
+/** Whether a subagent has ended, so "Archive finished" may hide it. */
+export const subagentFinished = (agent) => ["completed", "failed", "cancelled"].includes(agent.status);
+
+/** The state with one of a chat's subagents archived or brought back; archiving only hides it, the provider carries on. */
+export function archiveSubagent(state, sessionId, id, archived) {
+  const session = state.sessions[sessionId];
+  if (!session?.subagents?.some((agent) => agent.id === id)) return state;
+  return { ...state, sessions: { ...state.sessions, [sessionId]: { ...session, subagents: session.subagents.map((agent) => (agent.id === id ? { ...agent, archived } : agent)) } } };
+}
+
+/** The state with a chat's finished subagents archived; unchanged state is returned as is. */
+export function archiveFinishedSubagents(state, sessionId) {
+  const session = state.sessions[sessionId];
+  if (!session?.subagents?.some((agent) => !agent.archived && subagentFinished(agent))) return state;
+  return { ...state, sessions: { ...state.sessions, [sessionId]: { ...session, subagents: session.subagents.map((agent) => (!agent.archived && subagentFinished(agent) ? { ...agent, archived: true } : agent)) } } };
+}

@@ -66,6 +66,11 @@ export interface ModelOption {
   recommended?: boolean;
 }
 
+/** Claude's faster inference is offered only on these Opus models. */
+export function supportsFastMode(model: Pick<ModelOption, "provider" | "id">): boolean {
+  return model.provider === "claude" && ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"].includes(model.id);
+}
+
 /**
  * The maintained list: what codex-cli 0.158.0 and Claude Code 2.1.287 report, recommended model first.
  * The picker shows it until the agents report their own lists (agent:models), and for an agent whose
@@ -121,6 +126,14 @@ export interface DiffStat {
   removed: number;
 }
 
+export interface PullRequest {
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "MERGED";
+  readyToMerge: boolean;
+}
+
 export interface Worktree {
   id: number;
   project_id: number;
@@ -142,6 +155,7 @@ export interface AgentSession {
   provider?: ModelProvider;
   /** Claude session id or Codex thread id, used to resume the agent's memory. */
   native_session_id?: string;
+  subagents?: Subagent[];
   /** A name the user gave the chat; otherwise it's named after its first message. */
   title?: string;
   /** A turn ended while the chat wasn't open, or the user marked it unread. */
@@ -174,6 +188,7 @@ export interface ChatMessage {
   role?: "user" | "assistant";
   model?: string;
   images?: ImageAttachment[];
+  files?: string[];
   /** How the agent turn that produced this reply ended. */
   outcome?: "completed" | "failed" | "cancelled";
   /** The tool calls the agent made in this reply, and its thinking, in the order they started. */
@@ -192,6 +207,8 @@ export interface ChatStep {
   status: "running" | "done" | "failed";
   /** The command and its output, a unified diff, or the thinking summary, capped at 20,000 characters. */
   detail?: string;
+  /** The file a read or edit worked on, as the tool named it; the title shows only its name. */
+  file?: string;
   /** How long a thinking step took. */
   durationMs?: number;
   /** Where the step sits in the reply: the length of the reply's text when it started. */
@@ -199,6 +216,7 @@ export interface ChatStep {
 }
 
 export interface ImageAttachment {
+  path?: string;
   id: string;
   name: string;
   dataUrl: string;
@@ -261,14 +279,30 @@ export type QuestionAnswers = Record<string, string[]>;
 
 export type QuestionOutcome = "answered" | "dismissed" | "cancelled";
 
+export interface Subagent {
+  id: string;
+  archived?: boolean;
+  parentId?: string;
+  title: string;
+  prompt?: string;
+  status: "initializing" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "unknown";
+  startedAt: number;
+  updatedAt: number;
+  endedAt?: number;
+  latestActivity?: string;
+  transcript: Array<{ id: string; kind: "tool" | "message"; text: string }>;
+}
+
 export type AgentEvent =
   /** Milagre's own event: the user's message was saved, so a turn starts, or a running one is steered and its reply split. */
   | { type: "message-sent"; model: string }
+  | { type: "subagent-update"; agent: Subagent }
+  | { type: "subagents-waiting"; waiting: boolean }
   | { type: "session-started"; nativeId: string }
   | { type: "session-reset" }
   | { type: "turn-started"; turnId: string | null }
   | { type: "text-delta"; messageId: string | null; text: string }
-  | { type: "step-started"; step: Pick<ChatStep, "id" | "kind" | "title" | "detail"> }
+  | { type: "step-started"; step: Pick<ChatStep, "id" | "kind" | "title" | "detail" | "file"> }
   | { type: "step-output"; id: string; text: string }
   | { type: "step-completed"; id: string; status: "done" | "failed"; title?: string; detail?: string; durationMs?: number }
   | ({ type: "permission-request" } & PermissionRequest)
@@ -286,13 +320,30 @@ export interface ChatSendRequest {
   /** The chat to send to, or null for a new chat in the worktree. */
   sessionId: number | null;
   worktreeId: number;
+  /** The message as the chat shows it. */
   body: string;
   images: ImageAttachment[];
+  /** Paths of the files attached to the message. */
+  files: string[];
+  /** What the agent is sent: the body with the attached files listed. */
+  prompt: string;
   provider: ModelProvider;
   model: string;
   permissionMode: PermissionMode;
   effort?: EffortLevel;
   ultracode?: boolean;
+  /** Claude only: faster Opus output at premium usage rates. */
+  fastMode?: boolean;
+  /** How long Claude's replies run; Claude only, Codex ignores it. */
+  replies?: "concise" | "normal";
+  /** Apply bundled TLDR writing rules to both providers. Defaults to true. */
+  tldrEnabled?: boolean;
+}
+
+/** A code editor found on this Mac. */
+export interface EditorInfo {
+  id: string;
+  name: string;
 }
 
 export interface WorktreeRequest {
@@ -334,7 +385,7 @@ export interface SkillOption {
   name: string;
   description: string;
   path: string;
-  scope: "workspace" | "user";
+  scope: "workspace" | "user" | "bundled";
   provider: string;
 }
 

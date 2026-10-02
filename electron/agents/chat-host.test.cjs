@@ -50,9 +50,10 @@ function projectState(projectPath) {
 }
 
 // The main process's chat wiring with fake agents and two projects saved in memory, as main.cjs builds it.
-function harness({ failStart = null } = {}) {
+function harness({ failStart = null, focused = true } = {}) {
   const saved = new Map();
   const published = [];
+  const broadcasts = [];
   const created = [];
   const states = new ProjectStates({
     read: async (projectPath) => projectState(projectPath),
@@ -71,9 +72,11 @@ function harness({ failStart = null } = {}) {
     states,
     startTurn: (request) => (failStart ? Promise.reject(new Error(failStart)) : manager.startTurn({ ...request, command: "/bin/agent" })),
     publish: (chatId, event, state, seq) => published.push({ chatId, event, state, seq }),
+    broadcast: (projectPath, state) => broadcasts.push({ projectPath, state }),
+    isFocused: () => focused,
   });
   const session = (cwd) => created.find((item) => item.options.cwd === cwd);
-  return { host, manager, states, saved, published, created, session };
+  return { host, manager, states, saved, published, broadcasts, created, session };
 }
 
 const message = (projectPath, body, extra = {}) => ({ projectPath, sessionId: null, worktreeId: 1, body, images: [], provider: "claude", model: "claude-opus-5-5", permissionMode: "auto", ...extra });
@@ -206,4 +209,49 @@ test("a window that loads mid-turn takes the runs and skips the events they hold
     .reduce((current, item) => applyRunEvent(current, item.chatId, item.event), snapshot.runs);
   assert.equal(runs[chatId].text, "Before reload. After reload.");
   assert.ok(published.every((item) => typeof item.seq === "number"));
+});
+
+test("a turn that ends in the open chat while no window has focus leaves it unread", async (t) => {
+  const { host, manager, saved, session } = harness({ focused: false });
+  t.after(() => manager.closeAll());
+  const chat = await host.send(message(ALPHA, "go"));
+  host.setOpenChat(`${ALPHA}#${chat.sessionId}`);
+  await waitUntil(() => session(ALPHA));
+  session(ALPHA).emit({ type: "turn-started", turnId: "t1" });
+  session(ALPHA).emit({ type: "turn-completed" });
+  await waitUntil(() => saved.get(ALPHA)?.messages.length === 2);
+
+  assert.equal(saved.get(ALPHA).sessions[chat.sessionId].unread, true);
+});
+
+test("a note added while the chat's turn runs lands after the reply", async (t) => {
+  const { host, manager, saved, session } = harness();
+  t.after(() => manager.closeAll());
+  const chat = await host.send(message(ALPHA, "commit it"));
+  const chatId = `${ALPHA}#${chat.sessionId}`;
+  await waitUntil(() => session(ALPHA));
+  session(ALPHA).emit({ type: "turn-started", turnId: "t1" });
+  session(ALPHA).emit({ type: "text-delta", messageId: "m1", text: "Committing." });
+  await waitUntil(() => host.runs[chatId]?.text === "Committing.");
+
+  await host.addNote(chatId, { body: "Committed abc123", context: { kind: "git-action" } });
+  assert.equal(saved.get(ALPHA).messages.length, 1, "the note waits for the turn");
+  session(ALPHA).emit({ type: "turn-completed" });
+  await waitUntil(() => saved.get(ALPHA)?.messages.length === 3);
+
+  assert.deepEqual(saved.get(ALPHA).messages.map(({ role, body, context }) => ({ role, body, context })), [
+    { role: "user", body: "commit it", context: null },
+    { role: "assistant", body: "Committing.", context: null },
+    { role: "assistant", body: "Committed abc123", context: { kind: "git-action" } },
+  ]);
+});
+
+test("a note for a chat with no turn running is saved at once and sent to the windows", async () => {
+  const { host, saved, broadcasts } = harness({ failStart: "no agent" });
+  const chat = await host.send(message(BETA, "hi"));
+  await waitUntil(() => saved.get(BETA)?.messages.length === 2);
+  await host.addNote(`${BETA}#${chat.sessionId}`, { body: "Pushed to origin", context: { kind: "git-action" } });
+
+  assert.equal(saved.get(BETA).messages.at(-1).body, "Pushed to origin");
+  assert.equal(broadcasts.at(-1).state.messages.at(-1).body, "Pushed to origin");
 });

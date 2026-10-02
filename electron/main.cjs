@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, nativeImage, Notification, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, nativeImage, Notification, powerSaveBlocker, shell, protocol, net } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const { execFile } = require("node:child_process");
 const fs = require("node:fs/promises");
@@ -6,6 +6,9 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { promisify } = require("node:util");
 const { decodeImages } = require("./image-input.cjs");
+const { detectEditors, openInEditor } = require("./editors.cjs");
+const { revealFolder } = require("./reveal.cjs");
+const { KeepAwake } = require("./keep-awake.cjs");
 const { guardNavigation } = require("./links.cjs");
 const { AttentionNotifier } = require("./notifications.cjs");
 const { ClaudeSession } = require("./agents/claude-provider.cjs");
@@ -18,20 +21,30 @@ const { cliWhenLoggedIn, createCliStatus } = require("./agents/status.cjs");
 const { SessionManager } = require("./agents/session-manager.cjs");
 const { ChatHost } = require("./agents/chat-host.cjs");
 const { discoverSkills, expandSkillPrompt } = require("./skills.cjs");
-const { createWorktree, listBranches, renameWorktreeBranch } = require("./worktrees.cjs");
+const { DEFAULT_WORKTREE_ROOT, createWorktree, listBranches, renameWorktreeBranch } = require("./worktrees.cjs");
 const { suggestWorktreeName } = require("./worktree-name.cjs");
+const { removeWorktree, worktreeStatus } = require("./worktree-cleanup.cjs");
+const { previewFilesToCopy } = require("./worktree-files.cjs");
+const { createProjectSettings } = require("./project-settings.cjs");
 const { readDiffStat } = require("./diffstat.cjs");
-const { reconcileState } = require("./project-state.cjs");
+const { registerGitHandlers } = require("./git-ipc.cjs");
+const { readPullRequest } = require("./pull-request.cjs");
+const { reconcileState, markDisconnectedSubagents } = require("./project-state.cjs");
 const { ProjectStates } = require("./project-states.cjs");
 const { DiffRefresher } = require("./diff-refresh.cjs");
 const { projectOfKey, sessionIdFromKey } = require("./shared/agent-runs.mjs");
-const { patchSession, renameWorktree } = require("./shared/project-edits.mjs");
+const { archiveFinishedSubagents, archiveSubagent, patchSession, renameWorktree } = require("./shared/project-edits.mjs");
 const { attentionContext, attentionNotice } = require("./shared/attention.mjs");
 const { resolveProjectImage } = require("./project-image.cjs");
 const { saveProjectState, stateFile } = require("./project-store.cjs");
+const { createRecentProjects, rememberProject, switchTarget } = require("./recent-projects.cjs");
 const { createUsageReader } = require("./usage.cjs");
 const { createUsageStore, cachedSnapshot } = require("./usage-cache.cjs");
 
+const { createFileSearch } = require("./project-files.cjs");
+const searchFiles = createFileSearch();
+const { createMediaHandler } = require("./media.cjs");
+protocol.registerSchemesAsPrivileged([{ scheme: "milagre-media", privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
 const execFileAsync = promisify(execFile);
 
 const appIconPath = path.join(__dirname, "../app/public/logo-milagre-image.png");
@@ -122,13 +135,26 @@ const diffs = new DiffRefresher({ states, readDiffStat, update: updateProject })
 
 // Reading a project matches its worktrees with the ones git lists now. A project read before keeps the
 // state this run has built, so a chat's turn that's still running isn't lost.
+// A subagent saved as running without a live agent session behind it (after a restart) is marked disconnected.
 async function readProject(projectPath) {
   const discovered = await discoverWorktrees(projectPath);
-  const state = await updateProject(projectPath, (current) => reconcileState(current, projectName(projectPath), discovered));
+  const live = (sessionId) => {
+    const entry = agents.sessions.get(`${projectPath}#${sessionId}`);
+    return Boolean(entry && !entry.session.closed);
+  };
+  const state = await updateProject(projectPath, (current) => {
+    const next = reconcileState(current, projectName(projectPath), discovered);
+    return markDisconnectedSubagents(next, new Set(Object.keys(next.sessions).map(Number).filter(live)));
+  });
   void diffs.refresh(projectPath).catch(() => {});
   return { path: projectPath, name: projectName(projectPath), state };
 }
 
+ipcMain.handle("project:files", async (_event, root, query) => {
+  const known = (await Promise.all(states.projects().map(discoverWorktrees))).flat();
+  if (!known.some(worktree => worktree.path === root)) throw new Error("Choose an open project's worktree.");
+  return searchFiles(root, query);
+});
 ipcMain.handle("skills:list", (_event, projectPath) => discoverSkills(projectPath));
 ipcMain.handle("project:branches", (_event, projectPath) => listBranches(projectPath));
 // The avatar lookup runs `gh`, which a Finder launch only finds once the login environment is applied.
@@ -138,6 +164,58 @@ ipcMain.handle("project:image", async (_event, projectPath) => {
 });
 // Packaged builds get their release version from electron-builder metadata, not the source package.json.
 ipcMain.handle("app:version", () => app.getVersion());
+// Where Milagre's worktrees live. An unpackaged build can point it elsewhere (live checks use a temporary folder).
+function worktreeRoot() {
+  return (!app.isPackaged && process.env.MILAGRE_WORKTREE_ROOT) || DEFAULT_WORKTREE_ROOT;
+}
+
+let projectSettingsStore = null;
+function projectSettings() {
+  projectSettingsStore ??= createProjectSettings(path.join(app.getPath("userData"), "project-settings.json"));
+  return projectSettingsStore;
+}
+
+ipcMain.handle("worktree:roots", async () => {
+  const root = worktreeRoot();
+  return [...new Set([root, await fs.realpath(root).catch(() => root)])];
+});
+// The git calls below wait for the login environment, so they run with the merged PATH.
+ipcMain.handle("worktree:status", async (_event, worktreePath, base) => {
+  await environmentReady;
+  return worktreeStatus(worktreePath, base);
+});
+// The renderer sends what the user saw (base, status, chat) and the project; main re-checks after closing the chat's agent.
+// The path and branch are read from git as they are now, so a branch renamed after creation is found as it is.
+ipcMain.handle("worktree:remove", async (_event, worktreePath, options = {}) => {
+  const { force, base, projectPath, chatId, seen } = options;
+  await environmentReady;
+  const result = await removeWorktree({
+    path: worktreePath,
+    root: worktreeRoot(),
+    projectPath,
+    base,
+    seen,
+    force: Boolean(force),
+    closeSession: typeof chatId === "string" ? () => agents.closeChat(chatId) : undefined,
+  });
+  // Read again, the project drops the worktree git no longer lists, with its chats.
+  if (states.has(projectPath)) await readProject(projectPath);
+  return result;
+});
+ipcMain.handle("files-to-copy:read", async (_event, projectPath) => {
+  await environmentReady;
+  const { filesToCopy } = await projectSettings().get(projectPath);
+  return { filesToCopy, ...(await previewFilesToCopy(projectPath, filesToCopy)) };
+});
+ipcMain.handle("files-to-copy:preview", async (_event, projectPath, patterns) => {
+  await environmentReady;
+  return previewFilesToCopy(projectPath, patterns);
+});
+ipcMain.handle("files-to-copy:save", async (_event, projectPath, patterns) => {
+  await environmentReady;
+  const { filesToCopy } = await projectSettings().setFilesToCopy(projectPath, patterns);
+  return { filesToCopy, ...(await previewFilesToCopy(projectPath, filesToCopy)) };
+});
 // A new worktree starts on its prompt's first words; a better name replaces its branch's once Haiku
 // picks one, so the chat never waits on it.
 async function nameWorktree(sender, projectPath, created, prompt) {
@@ -151,8 +229,13 @@ async function nameWorktree(sender, projectPath, created, prompt) {
   if (!sender.isDestroyed()) sender.send("worktree:renamed", { projectPath, path: created.path, from: created.branch, name });
 }
 
-ipcMain.handle("worktree:create", async (event, request) => {
-  const created = await createWorktree(request);
+ipcMain.handle("worktree:create", async (event, { projectPath, baseBranch, prompt }) => {
+  // Only these fields come from the renderer: the worktree folder and the files copied into it are main's call.
+  const request = { projectPath, baseBranch, prompt };
+  await environmentReady;
+  // The files are copied into the folder git just made; the rename that follows only changes the branch, so the path holds.
+  const created = await createWorktree({ ...request, root: worktreeRoot(), copyPatterns: (await projectSettings().get(projectPath)).filesToCopy });
+  if (created.copy?.notes.length) console.warn("Milagre worktree file copy:", created.copy.notes.join(" "));
   const project = await readProject(request.projectPath);
   const listed = Object.values(project.state.worktrees).find((item) => item.name === created.branch);
   if (!listed) throw new Error(`Created ${created.branch}, but git did not list it as a worktree.`);
@@ -163,12 +246,31 @@ ipcMain.handle("worktree:create", async (event, request) => {
   void nameWorktree(event.sender, request.projectPath, created, request.prompt ?? "").catch(() => {});
   return { project: { ...project, state }, worktreeId: listed.id };
 });
-// Only a git checkout's top folder opens, so the renderer can't open arbitrary paths.
-ipcMain.handle("worktree:reveal", async (_event, worktreePath) => {
-  const { stdout } = await execFileAsync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
-  if ((await fs.realpath(stdout.trim())) !== (await fs.realpath(worktreePath))) throw new Error(`${worktreePath} is not a worktree.`);
-  const error = await shell.openPath(worktreePath);
-  if (error) throw new Error(error);
+// Re-reads some worktrees' diff stats at once, e.g. after a commit from the "Commit and open PR" dialog.
+ipcMain.handle("worktree:refresh-diffs", (_event, projectPath, worktreeIds) => {
+  if (!states.has(projectPath) || !Array.isArray(worktreeIds)) return undefined;
+  return diffs.refresh(projectPath, worktreeIds.filter((id) => Number.isInteger(id)));
+});
+ipcMain.handle("worktree:pull-request", async (_event, worktreePath) => {
+  await environmentReady;
+  return readPullRequest(worktreePath);
+});
+// A project or worktree folder in the file manager; only a checkout's top folder opens (see reveal.cjs).
+ipcMain.handle("project:reveal", (_event, folder) => revealFolder(folder, { open: (target) => shell.openPath(target) }));
+
+// Installed editors are looked up once per run.
+let editorsFound = null;
+// Looked up after the login shell filled in PATH, so CLIs from a Finder launch are found.
+// A failed lookup is not kept, so the next call looks again.
+const editors = () => (editorsFound ??= environmentReady.then(() => detectEditors()).catch((error) => {
+  editorsFound = null;
+  throw error;
+}));
+ipcMain.handle("editor:list", async () => (await editors()).map(({ id, name }) => ({ id, name })));
+// Resolves to null on success, or a short message to show as a notice.
+ipcMain.handle("editor:open", async (_event, request) => {
+  if (!request || typeof request.root !== "string") return "File not found";
+  return openInEditor({ root: request.root, path: request.path, line: request.line, editor: request.editor }, { editors: await editors() });
 });
 
 // Brings the window back from a notification click and opens the chat it was about.
@@ -186,6 +288,7 @@ const notifier = new AttentionNotifier({
   createNotification: ({ title, subtitle, body }) => new Notification({ title, body, ...(subtitle ? { subtitle } : {}) }),
   isAppFocused: () => Boolean(BrowserWindow.getFocusedWindow()),
   openChat: openChatFromNotification,
+  setBadge: value => app.dock?.setBadge(value),
 });
 
 // The window reports the "Notify when waiting" setting, kept with its other settings.
@@ -202,8 +305,17 @@ async function notifyIfWaiting(chatId, event) {
   if (notice) notifier.notify({ chatId, requestId: event.requestId, ...notice });
 }
 
+ipcMain.handle("notification:state", (_event, state) => notifier.sync(state));
+ipcMain.handle("notification:completed", (_event, notice) => Notification.isSupported() ? notifier.notifyCompletion(notice) : false);
+
+// While any chat's turn runs the Mac stays awake (the screen can still sleep). On until the renderer
+// pushes the saved setting.
+const keepAwake = new KeepAwake({ powerSaveBlocker });
+ipcMain.handle("app:set-keep-awake", (_event, enabled) => keepAwake.setEnabled(enabled === true));
+
 function publishAgentEvent(chatId, event, state, seq) {
   notifier.observe(chatId, event);
+  keepAwake.observe(chatId, event);
   void notifyIfWaiting(chatId, event).catch(() => {});
   diffs.observe(chatId, event);
   // A turn that just failed on a login problem makes a "ready" picker status out of date.
@@ -221,6 +333,7 @@ const agents = new SessionManager({
   createSession: (provider, options) => (provider === "codex"
     ? new CodexSession({ ...options, clientVersion: app.getVersion() })
     : new ClaudeSession(options)),
+  onSessionClosed: (chatId) => keepAwake.chatClosed(chatId),
   send: (chatId, event) => void chats.receive(chatId, event),
 });
 
@@ -236,7 +349,13 @@ async function startAgentTurn(request) {
   return agents.startTurn({ ...request, prompt, images, command: cli.command });
 }
 
-const chats = new ChatHost({ states, startTurn: startAgentTurn, publish: publishAgentEvent });
+const chats = new ChatHost({
+  states,
+  startTurn: startAgentTurn,
+  publish: publishAgentEvent,
+  broadcast: broadcastProjectState,
+  isFocused: () => Boolean(BrowserWindow.getFocusedWindow()),
+});
 
 // Each CLI is found and its version checked once per run; a missing or outdated one is checked again on the next message.
 const agentCli = createCliCache({ ready: () => environmentReady, refresh: () => refreshInstallPath() });
@@ -244,15 +363,36 @@ const agentCli = createCliCache({ ready: () => environmentReady, refresh: () => 
 ipcMain.handle("usage:read", () => readUsage());
 ipcMain.handle("usage:cached", () => cachedSnapshot(usageStore, Date.now()));
 
+// The "Commit and open PR" dialog: Milagre runs git and gh itself, in the chat's folder, once the login
+// environment is in (gh from a Finder launch). Its one-shot text call starts the CLI agentCli found.
+registerGitHandlers(ipcMain, {
+  cli: (name) => agentCli(name),
+  ready: () => environmentReady,
+  clientVersion: app.getVersion(),
+  knownFolders: async () => (await Promise.all(states.projects().map(discoverWorktrees))).flat().map((worktree) => worktree.path),
+});
+
 ipcMain.handle("chat:send", (_event, request) => {
   if (!states.has(request?.projectPath)) throw new Error("Open the project before sending to its chats.");
   return chats.send(request);
 });
 ipcMain.handle("chat:patch", (_event, projectPath, sessionId, patch) => (states.has(projectPath) ? updateProject(projectPath, (state) => patchSession(state, sessionId, patch ?? {})).then(() => {}) : undefined));
 // Opening a chat reads it. Only on opening: "Mark as unread" on the open chat sticks until it's opened again.
-ipcMain.handle("chat:set-open", async (_event, chatId) => {
+ipcMain.handle("chat:archive-subagent", (_event, projectPath, sessionId, id, archived) => (states.has(projectPath) ? updateProject(projectPath, (state) => archiveSubagent(state, sessionId, String(id), archived === true)).then(() => {}) : undefined));
+ipcMain.handle("chat:archive-finished-subagents", (_event, projectPath, sessionId) => (states.has(projectPath) ? updateProject(projectPath, (state) => archiveFinishedSubagents(state, sessionId)).then(() => {}) : undefined));
+// What the "Commit and open PR" dialog did, as a line in its chat.
+ipcMain.handle("chat:git-note", (_event, chatId, body) => {
+  if (typeof chatId !== "string" || typeof body !== "string" || !states.has(projectOfKey(chatId))) return undefined;
+  return chats.addNote(chatId, { body, context: { kind: "git-action" } });
+});
+/** Reads the chat on screen: on opening it, and when a window regains focus over it. */
+async function readOpenChat() {
+  const chatId = chats.openChat;
+  if (chatId && states.has(projectOfKey(chatId))) await updateProject(projectOfKey(chatId), (state) => patchSession(state, sessionIdFromKey(chatId), { unread: false }));
+}
+ipcMain.handle("chat:set-open", (_event, chatId) => {
   chats.setOpenChat(chatId);
-  if (typeof chatId === "string" && states.has(projectOfKey(chatId))) await updateProject(projectOfKey(chatId), (state) => patchSession(state, sessionIdFromKey(chatId), { unread: false }));
+  return readOpenChat();
 });
 // A window that loads (or reloads) mid-turn picks the turns up where they are, cards included.
 ipcMain.handle("chat:runs", () => chats.snapshot());
@@ -302,26 +442,40 @@ function createWindow() {
   }
 }
 
-ipcMain.handle("project:current", () => readProject(process.cwd()));
+let recentStore = null;
+const recentProjects = () => (recentStore ??= createRecentProjects(path.join(app.getPath("userData"), "recent-projects.json")));
+// Each way a project opens (launch, the folder dialog, a switch) puts it at the top of the recent list.
+async function openProject(projectPath) {
+  const project = await readProject(projectPath);
+  await rememberProject(recentProjects(), projectPath);
+  return project;
+}
+
+ipcMain.handle("project:current", () => openProject(process.cwd()));
 ipcMain.handle("project:open", async () => {
   const result = await dialog.showOpenDialog({
     title: "Open project",
     properties: ["openDirectory", "createDirectory"],
   });
   if (result.canceled || !result.filePaths[0]) return null;
-  return readProject(result.filePaths[0]);
+  return openProject(result.filePaths[0]);
 });
-// Only a project already read this run can be read again by path, so the renderer can't open arbitrary folders.
-ipcMain.handle("project:read", (_event, projectPath) => (states.has(projectPath) ? readProject(projectPath) : null));
+ipcMain.handle("project:recent", () => recentProjects().list());
+ipcMain.handle("project:switch", async (_event, requested) => openProject(await switchTarget(recentProjects(), requested)));
+ipcMain.handle("project:forget", (_event, projectPath) => recentProjects().forget(projectPath));
 
 app.whenReady().then(async () => {
+  protocol.handle("milagre-media", createMediaHandler((url, options) => net.fetch(url, options)));
   app.setName("Milagre");
   if (process.platform === "darwin" && app.dock) {
     const appIcon = nativeImage.createFromPath(appIconPath);
     if (!appIcon.isEmpty()) app.dock.setIcon(appIcon);
   }
   createWindow();
-  app.on("browser-window-focus", () => diffs.focused());
+  app.on("browser-window-focus", () => {
+    diffs.focused();
+    void readOpenChat().catch(() => {});
+  });
   autoUpdater.on("update-available", (info) => publishUpdateState({ status: "downloading", version: info.version }));
   autoUpdater.on("download-progress", (progress) => publishUpdateState({ status: "downloading", progress: progress.percent }));
   autoUpdater.on("update-downloaded", (info) => publishUpdateState({ status: "downloaded", version: info.version, progress: 100 }));
@@ -343,6 +497,7 @@ app.on("before-quit", (event) => {
   if (agentsClosed) return;
   event.preventDefault();
   agentsClosed = true;
+  keepAwake.quit();
   // Agents run in their own process groups, so stop them before the app exits.
   // Their cancelled turns are saved before the app exits.
   Promise.race([agents.closeAll().then(() => states.flush()), new Promise((resolve) => setTimeout(resolve, 5000))]).finally(() => app.quit());

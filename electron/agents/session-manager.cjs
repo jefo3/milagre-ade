@@ -1,3 +1,4 @@
+const { active: activeSubagent } = require("./subagents.cjs");
 const { isTerminal } = require("./events.cjs");
 const { PERMISSION_MODES, USER_DECISIONS } = require("./permissions.cjs");
 const { validAnswers } = require("./questions.cjs");
@@ -18,11 +19,11 @@ function streamKey(event) {
 // period, and are replaced when they crash or the chat changes provider or working directory.
 // Text deltas and command output are batched so fast streams don't flood IPC; a batch of output
 // keeps only the end the renderer would keep. Replacing and closing a chat's
-// session run one at a time per chat, and events from a session that is no longer the chat's
+// session run one at a time per chat, and onSessionClosed(chatId) runs once a chat's session is gone. Events from a session that is no longer the chat's
 // current one are dropped. A turn's session steers it when the chat sends again while it runs.
 class SessionManager {
-  constructor({ createSession, send, idleMs = IDLE_MS, batchMs = BATCH_MS }) {
-    Object.assign(this, { createSession, send, idleMs, batchMs });
+  constructor({ createSession, send, onSessionClosed = () => {}, idleMs = IDLE_MS, batchMs = BATCH_MS }) {
+    Object.assign(this, { createSession, send, onSessionClosed, idleMs, batchMs });
     this.sessions = new Map();
     this.buffers = new Map();
     this.queues = new Map();
@@ -31,7 +32,7 @@ class SessionManager {
   async startTurn(request) {
     const start = (entry) => {
       clearTimeout(entry.idleTimer);
-      return entry.session.startTurn({ prompt: request.prompt, images: request.images, model: request.model, permissionMode: request.permissionMode, effort: request.effort, ultracode: request.ultracode });
+      return entry.session.startTurn({ prompt: request.prompt, images: request.images, model: request.model, permissionMode: request.permissionMode, effort: request.effort, ultracode: request.ultracode, fastMode: request.fastMode, replies: request.replies });
     };
     const entry = await this.serial(request.chatId, () => this.currentEntry(request));
     try {
@@ -46,12 +47,18 @@ class SessionManager {
   async currentEntry(request) {
     const { chatId, provider, cwd } = request;
     const existing = this.sessions.get(chatId);
-    if (existing && existing.provider === provider && existing.cwd === cwd && !existing.session.closed) return existing;
+    const tldrEnabled = request.tldrEnabled !== false;
+    const sameChat = existing && existing.provider === provider && existing.cwd === cwd;
+    // System instructions are fixed for a provider session. Resume it between turns when
+    // the preference changes, preserving its native history and any running reply.
+    if (sameChat && !existing.session.closed && (existing.tldrEnabled === tldrEnabled || existing.session.turnActive)) return existing;
+    const resumeId = sameChat && !existing.session.closed ? existing.session.nativeId ?? request.resumeId : request.resumeId;
     if (existing) await this.closeEntry(chatId, existing);
-    const entry = { provider, cwd, session: null, idleTimer: null };
+    const entry = { provider, cwd, tldrEnabled, session: null, idleTimer: null };
     entry.session = this.createSession(provider, {
       cwd,
-      resumeId: request.resumeId,
+      resumeId,
+      tldrEnabled,
       command: request.command,
       emit: (event) => this.forward(chatId, entry, event),
     });
@@ -82,6 +89,16 @@ class SessionManager {
       return;
     }
     this.flush(chatId);
+    if (event.type === "subagent-update") {
+      entry.activeChildren ??= new Set();
+      if (activeSubagent(event.agent)) {
+        entry.activeChildren.add(event.agent.id);
+        clearTimeout(entry.idleTimer);
+      } else {
+        entry.activeChildren.delete(event.agent.id);
+        if (!entry.session.turnActive) this.scheduleIdleClose(chatId);
+      }
+    }
     this.send(chatId, event);
     // A turn the provider started itself (a steer that missed the end of the last one) isn't covered by
     // startTurn's clear; the timer armed by the previous turn's end must not close it mid-run.
@@ -101,6 +118,7 @@ class SessionManager {
     const entry = this.sessions.get(chatId);
     if (!entry) return;
     clearTimeout(entry.idleTimer);
+    if (entry.activeChildren?.size) return;
     entry.idleTimer = setTimeout(() => {
       void this.serial(chatId, () => (this.sessions.get(chatId) === entry ? this.closeEntry(chatId, entry) : undefined)).catch(() => {});
     }, this.idleMs);
@@ -143,6 +161,7 @@ class SessionManager {
     if (this.sessions.get(chatId) !== entry) return;
     this.flush(chatId);
     this.sessions.delete(chatId);
+    this.onSessionClosed(chatId);
   }
 
   async closeAll() {

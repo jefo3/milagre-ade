@@ -1,3 +1,4 @@
+const { claudeSubagents, codexSubagents } = require("./subagents.cjs");
 // Normalised events every agent session emits. The main process forwards them to the
 // renderer as { chatId, event }, where chatId is the chat key `${projectPath}#${sessionId}`:
 //   { type: "session-started", nativeId }   provider session or thread id; the chat saves it
@@ -25,7 +26,16 @@
 
 const { claudeStep, claudeStepResult, codexStep, codexStepResult, thinkingEnd, thinkingStep } = require("./steps.cjs");
 
-const MILAGRE_INSTRUCTIONS = "You are an agent inside Milagre, an agent development environment. Answer the user concisely and humanly. Do not claim to have changed files unless you actually did. When you need the user to choose between options, ask with your question tool if you have one (AskUserQuestion or request_user_input); otherwise ask in your reply as a short numbered list.";
+const { bundledWritingInstructions } = require("../bundled-skills.cjs");
+const TLDR_INSTRUCTIONS = bundledWritingInstructions();
+function milagreInstructions(tldrEnabled = true) {
+  return [
+    "You are an agent inside Milagre, an agent development environment. Answer the user concisely and humanly. Do not claim to have changed files unless you actually did.",
+    tldrEnabled ? TLDR_INSTRUCTIONS : "Automatic TLDR writing is disabled in Settings. Do not carry forward previously applied automatic TLDR rules. Explicit /tldr requests and the user's own writing preferences still apply.",
+    "When you need the user to choose between options, ask with your question tool if you have one (AskUserQuestion or request_user_input); otherwise ask in your reply as a short numbered list.",
+  ].join("\n\n");
+}
+const MILAGRE_INSTRUCTIONS = milagreInstructions();
 const RESUME_FAILED_MESSAGE = "Couldn't resume this chat's earlier agent session; it may have been deleted. Send your message again to continue in a fresh session.";
 const TERMINAL_TYPES = new Set(["turn-completed", "turn-failed", "turn-cancelled"]);
 
@@ -112,10 +122,10 @@ function textDelta(state, text) {
 // Claude Agent SDK message -> events. Partial messages (includePartialMessages) carry the
 // streamed text and thinking: a thinking block is a step from its start to its stop. Each assistant
 // message holds a finished content block: a tool_use block starts a step, and the tool_result in a
-// later user message ends it. Subagent messages (parent_tool_use_id set) are not part of the reply:
-// the Agent call that started them is the step.
+// later user message ends it. Child messages go to the subagent track; only the Agent
+// call that started them is a step in the parent reply.
 function mapClaudeMessage(message, state) {
-  const events = [];
+  const events = claudeSubagents(message, state);
   // Claude Code answers a turn it can't authenticate with a reply of its own ("Not logged in · Please run
   // /login") marked authentication_failed, then a failed result.
   if (message.type === "assistant" && message.error === "authentication_failed") state.authFailed = true;
@@ -175,6 +185,8 @@ function mapClaudeMessage(message, state) {
 // codex app-server notification -> events. Everything not listed is ignored on purpose:
 // the server also reports MCP startup, hooks, rate limits, token usage and the turn's running diff.
 function mapCodexNotification(method, params, state) {
+  const children = codexSubagents(method, params, state);
+  if (children.length) return children;
   if (params.threadId && state.threadId && params.threadId !== state.threadId) return [];
   if (method === "turn/started") return [{ type: "turn-started", turnId: params.turn?.id ?? null }];
   if ((method === "item/started" || method === "item/completed") && params.item) {
@@ -240,4 +252,4 @@ function codexReasoning(method, item, state) {
   return [...started, { type: "step-completed", ...thinkingEnd(id, startedAt === undefined ? undefined : now(state) - startedAt, summary) }];
 }
 
-module.exports = { MILAGRE_INSTRUCTIONS, RESUME_FAILED_MESSAGE, cliBrokenMessage, failedWith, cliTooOldMessage, crashMessage, isTerminal, lastLine, loginMessage, mapClaudeMessage, mapCodexNotification, missingCliMessage };
+module.exports = { MILAGRE_INSTRUCTIONS, milagreInstructions, RESUME_FAILED_MESSAGE, cliBrokenMessage, failedWith, cliTooOldMessage, crashMessage, isTerminal, lastLine, loginMessage, mapClaudeMessage, mapCodexNotification, missingCliMessage };
