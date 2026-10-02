@@ -18,6 +18,7 @@ function emptyState(projectName) {
   };
 }
 
+/** The state matched with the worktrees git lists now; a state that already matches is returned as is. */
 function reconcileState(rawState, projectName, discoveredWorktrees) {
   const state = rawState ?? emptyState(projectName);
   const existingWorktrees = Object.values(state.worktrees ?? {});
@@ -49,7 +50,7 @@ function reconcileState(rawState, projectName, discoveredWorktrees) {
   const tasks = Object.fromEntries(Object.entries(state.tasks ?? {}).filter(([, task]) => validWorktreeIds.has(task.worktree_id)));
   const artifacts = Object.fromEntries(Object.entries(state.artifacts ?? {}).filter(([, artifact]) => validWorktreeIds.has(artifact.worktree_id)));
 
-  return {
+  const next = {
     ...state,
     next_id: nextId,
     projects: { 1: { id: 1, name: projectName } },
@@ -61,6 +62,7 @@ function reconcileState(rawState, projectName, discoveredWorktrees) {
     tasks,
     artifacts,
   };
+  return rawState && JSON.stringify(next) === JSON.stringify(rawState) ? rawState : next;
 }
 
 module.exports = { emptyState, reconcileState };

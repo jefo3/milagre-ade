@@ -47,3 +47,10 @@ test("chats of a removed worktree are dropped and new worktrees get fresh ids", 
   assert.ok(Object.values(state.sessions).every((session) => session.id >= 4));
   assert.equal(new Set(Object.values(state.sessions).map((session) => session.worktree_id)).size, 2);
 });
+
+test("a state that already matches git's worktrees is returned as is", () => {
+  const discovered = [{ path: "/repo", name: "main" }];
+  const state = reconcileState(null, "repo", discovered);
+  assert.equal(reconcileState(state, "repo", discovered), state);
+  assert.notEqual(reconcileState(state, "repo", [...discovered, { path: "/repo-wt", name: "feature" }]), state);
+});
