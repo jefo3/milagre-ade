@@ -26,9 +26,7 @@ function Fixture() {
       projectPath="/fixture" draft={draft} onDraftChange={setDraft} onSend={noop} isSending={false} sendBlocked={false}
       models={MODEL_CATALOG} cliStatus={null} onModelPickerOpen={noop} selectedModel={MODEL_CATALOG[0]} onModelChange={noop}
       capability={capabilityFor(MODEL_CATALOG[0], null)} onEffortChange={noop} ultracode={false} onUltracodeChange={noop} permissionMode="auto" onPermissionModeChange={noop}
-      worktreeSummary="main" connectionSummary="No connection" eventsCount={0} firstWorktreeName="main"
-      firstAgentRunning={false} secondAgentRunning={false} onToggleFirst={noop} onToggleSecond={noop}
-      onCycleConnection={noop} onRecommendationSelect={noop} worktrees={[]} onWorktreeChange={noop}
+      onRecommendationSelect={noop} worktrees={[]} onWorktreeChange={noop}
       isolation="local" onIsolationChange={noop} branches={[]} baseBranch="main" onBaseBranchChange={noop} newChatError={null} />
   </div>;
 }

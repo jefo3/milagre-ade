@@ -138,13 +138,9 @@ function App() {
 
   const worktrees = useMemo(() => (state ? sortedWorktrees(state) : []), [state]);
   const firstWorktree = worktrees[0];
-  const secondWorktree = worktrees[1];
-  const firstSession = state && firstWorktree ? sessionForWorktree(state, firstWorktree.id) : undefined;
-  const secondSession = state && secondWorktree ? sessionForWorktree(state, secondWorktree.id) : undefined;
   const selectedSession = state && selectedSessionId !== null ? state.sessions[selectedSessionId] : undefined;
   const selectedWorktree = worktrees.find((worktree) => worktree.id === (selectedSession?.worktree_id ?? selectedWorktreeId)) ?? firstWorktree;
   const imageDraft = usePastedImages(selectedWorktree?.path ?? project?.path ?? "");
-  const connection = state ? Object.values(state.connections)[0] : undefined;
   const messages = state && selectedSession ? state.messages.filter((message) => message.session_id === selectedSession.id) : [];
   lockedProviderRef.current = messages.length > 0 ? selectedSession?.provider : undefined;
 
@@ -495,17 +491,6 @@ function App() {
             onUltracodeChange={setUltracode}
             permissionMode={permissionMode}
             onPermissionModeChange={changePermissionMode}
-            worktreeSummary={worktrees.length > 0 ? worktrees.map((worktree) => worktree.name).join(" ↔ ") : "No Git worktrees detected"}
-            connectionSummary={connection?.kind ?? "No connection"}
-            eventsCount={state.events.length}
-            firstWorktreeName={firstWorktree?.name ?? "No worktree"}
-            secondWorktreeName={secondWorktree?.name}
-            firstAgentRunning={firstSession?.status === "Running"}
-            secondAgentRunning={secondSession?.status === "Running"}
-            // Spec 001's never-rendered "Shared context" panel; its buttons do nothing until it's removed.
-            onToggleFirst={() => {}}
-            onToggleSecond={() => {}}
-            onCycleConnection={() => {}}
             onRecommendationSelect={(option) => void executeSend(option, permissionMode)}
             worktrees={worktrees.map((worktree) => ({ id: worktree.id, name: worktree.name, path: worktree.path }))}
             selectedWorktreeId={selectedWorktree?.id}
