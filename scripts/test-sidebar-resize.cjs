@@ -47,7 +47,7 @@ async function browserChecks() {
     await delay(400);
   };
   const screenshot = async name => {
-    const image = await window.webContents.capturePage();
+    const image = await window.webContents.capturePage({ x: 0, y: 0, width: 640, height: 500 });
     require("node:fs").writeFileSync(path.join(require("node:os").tmpdir(), `milagre-sidebar-${name}.png`), image.toPNG());
   };
   try {
@@ -57,12 +57,26 @@ async function browserChecks() {
     await waitFor('!!document.querySelector("aside")');
     await delay(400);
     assert.equal(await width(), 224, "starts at the default width");
+    await screenshot("default");
+    {
+      // Mid-drag, so the edge line shows.
+      const { x, y } = await handle();
+      mouse("mouseDown", x, y);
+      for (let i = 1; i <= 10; i++) { mouse("mouseMove", x + i * 8, y); await delay(16); }
+      await delay(100);
+      await screenshot("dragging");
+      mouse("mouseUp", x + 80, y);
+      await delay(400);
+      await evaluate('document.querySelector("[aria-label=\\"Resize sidebar\\"]").dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))');
+      await delay(400);
+    }
     await drag(100);
     assert.equal(await width(), 324, "drag right widens it");
     assert.equal(await evaluate('localStorage.getItem("milagre.sidebarWidth")'), "324");
     await screenshot("wide");
     await drag(400);
     assert.equal(await width(), 420, "clamps at the max");
+    await screenshot("max");
     await drag(-600);
     assert.equal(await width(), 224, "clamps at the min");
     await drag(150);
@@ -73,6 +87,7 @@ async function browserChecks() {
     await evaluate('document.querySelector("[aria-label=\\"Collapse sidebar\\"]").click()');
     await delay(400);
     assert.equal(await width(), 44, "collapses to the rail");
+    await screenshot("collapsed");
     assert.equal(await evaluate('document.querySelector("[aria-label=\\"Resize sidebar\\"]")'), null, "no handle on the rail");
     await evaluate('document.querySelector("[aria-label=\\"Expand sidebar\\"]").click()');
     await delay(400);
@@ -86,6 +101,7 @@ async function browserChecks() {
     window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Right" });
     await delay(400);
     assert.equal(await width(), 240, "arrow key widens by 16px");
+    console.log("Screenshots: default, dragging, wide, max, collapsed in the temp directory");
     console.log("PASS: drag widens, clamps 224..420, persists across reload, hidden when collapsed, restores on expand, double-click reset, keyboard");
     app.exit(0);
   } catch (error) {
