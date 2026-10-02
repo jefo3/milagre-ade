@@ -36,6 +36,7 @@ import { useWorktreePullRequests } from "./components/useWorktreePullRequests";
 import { usePastedImages } from "./components/usePastedImages";
 import { ChatComposer } from "./components/ChatComposer";
 import { DotBackground } from "./components/DotBackground";
+import { StartupSplash } from "./components/StartupSplash";
 import SidebarNav from "./components/SidebarNav";
 import { SettingsNav, SettingsPanel } from "./components/Settings";
 import { chatRevealPath } from "./lib/reveal";
@@ -187,7 +188,8 @@ function App() {
     const latest = statesRef.current[projectOfKey(chatId)];
     return latest ? lastUserModel(latest, sessionIdFromKey(chatId)) : "";
   });
-  const pullRequests = useWorktreePullRequests(project?.path ?? "", state);
+  const { pullRequests, dismissedConflicts, dismissConflictAction } = useWorktreePullRequests(project?.path ?? "", state);
+  const selectedPullRequest = selectedWorktree && pullRequests[selectedWorktree.path];
   const run = project && selectedSession ? agentRuns.runs[chatKey(project.path, selectedSession.id)] : undefined;
   const isSending = preparing || Boolean(run);
   const usage = useUsage();
@@ -495,7 +497,7 @@ function App() {
 
   const ipcError = (error: unknown) => (error instanceof Error ? error.message : String(error)).replace(/^Error invoking remote method '[^']+': (Error: )?/, "");
 
-  async function executeSend(body: string, mode: PermissionMode, images: ImageAttachment[] = imageDraft.images, files: string[] = imageDraft.files) {
+  async function executeSend(body: string, mode: PermissionMode, images: ImageAttachment[] = imageDraft.images, files: string[] = imageDraft.files, preserveComposer = false) {
     if ((!body && !images.length && !files.length) || !state || !selectedWorktree || !project || preparing || imageDraft.loading) return;
     setPreparing(true);
     setNewChatError(null);
@@ -537,8 +539,10 @@ function App() {
       if (projectRef.current?.path === project.path) {
         setSelectedSessionId(sessionId);
         setSelectedWorktreeId(openState()?.sessions[sessionId]?.worktree_id ?? target.worktreeId);
-        setDraft("");
-        imageDraft.clear();
+        if (!preserveComposer) {
+          setDraft("");
+          imageDraft.clear();
+        }
       }
     } catch (error) {
       setNewChatError(`Could not send the message: ${ipcError(error)}`);
@@ -627,8 +631,16 @@ function App() {
     return () => window.removeEventListener("keydown", jumpToChat);
   }, [chats, view]);
 
-  if (loading || !project || !state) {
-    return <div className="grid h-screen place-items-center overflow-hidden bg-page text-sm text-ink-3">Loading workspace…</div>;
+  // Fast loads would cut the startup animation off at the bare legs, so the splash stays until the logo is whole,
+  // then fades out over the app while the panes slide in. Same key in both trees keeps the logo from restarting.
+  const [splash, setSplash] = useState<"intro" | "done" | "gone">("intro");
+  const [appEntered, setAppEntered] = useState(false);
+  const splashOverlay = (leaving: boolean) => splash === "gone" ? null : (
+    <StartupSplash key="startup-splash" leaving={leaving} onIntroEnd={() => setSplash((current) => (current === "intro" ? "done" : current))} onLeft={() => setSplash("gone")} />
+  );
+
+  if (loading || !project || !state || splash === "intro") {
+    return <>{splashOverlay(false)}</>;
   }
 
   const modifier = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
@@ -664,7 +676,8 @@ function App() {
   })));
 
   return (
-    <DotBackground>
+    <>
+    <DotBackground key="app">
       <div aria-hidden className="fixed inset-x-0 top-0 z-50 h-10 [-webkit-app-region:drag]" />
       {update?.status === "downloaded" && (
         <div className="fixed inset-x-4 top-4 z-50 mx-auto flex max-w-2xl items-center justify-between gap-4 rounded-xl border border-blue-200 bg-white px-4 py-3 text-sm text-ink shadow-lg [-webkit-app-region:no-drag]">
@@ -680,7 +693,10 @@ function App() {
           <button type="button" onClick={() => setNotice(null)} className="shrink-0 font-medium text-ink-3 hover:text-ink">Dismiss</button>
         </div>
       )}
-      <div className="flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden text-ink">
+      <div
+        className={`flex min-h-0 min-w-0 flex-1 gap-3 overflow-hidden text-ink ${appEntered ? "" : "app-enter"}`}
+        onAnimationEnd={(event) => { if (event.animationName === "app-enter-main") setAppEntered(true); }}
+      >
       <div className={`min-h-0 shrink-0 pt-[60px] pb-3 pl-3 ${view === "chat" ? "flex" : "hidden"}`}>
       <SidebarNav
         key={project.path}
@@ -728,6 +744,12 @@ function App() {
             draft={draft}
             onDraftChange={setDraft}
             onSend={() => void sendMessage()}
+            onResolveConflicts={selectedSession && selectedPullRequest?.state === "OPEN" && selectedPullRequest.hasConflicts && !dismissedConflicts.includes(selectedPullRequest.url)
+              ? () => {
+                dismissConflictAction(selectedPullRequest);
+                void executeSend("Resolve the merge conflicts in this branch against the pull request's base branch. Preserve the intended changes from both sides and run the relevant checks.", permissionMode, [], [], true);
+              }
+              : undefined}
             isSending={isSending}
             sendBlocked={preparing}
             streamingText={run?.text}
@@ -814,6 +836,8 @@ function App() {
       )}
       <Notice />
     </DotBackground>
+    {splashOverlay(true)}
+    </>
   );
 }
 
