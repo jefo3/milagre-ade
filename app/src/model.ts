@@ -262,6 +262,8 @@ export type QuestionAnswers = Record<string, string[]>;
 export type QuestionOutcome = "answered" | "dismissed" | "cancelled";
 
 export type AgentEvent =
+  /** Milagre's own event: the user's message was saved, so a turn starts, or a running one is steered and its reply split. */
+  | { type: "message-sent"; model: string }
   | { type: "session-started"; nativeId: string }
   | { type: "session-reset" }
   | { type: "turn-started"; turnId: string | null }
@@ -278,18 +280,19 @@ export type AgentEvent =
   /** `notice`: a message Milagre wrote (it names the CLI and the fix), shown as it is; otherwise it is the agent's own error. */
   | { type: "turn-failed"; message: string; notice?: boolean; login?: boolean };
 
-export interface AgentStartTurnRequest {
-  /** The chat key, `${projectPath}#${sessionId}` (see `chatKey` in lib/agent-runs). */
-  chatId: string;
+/** A message for a chat. The main process saves it, then starts or steers the chat's turn. */
+export interface ChatSendRequest {
+  projectPath: string;
+  /** The chat to send to, or null for a new chat in the worktree. */
+  sessionId: number | null;
+  worktreeId: number;
+  body: string;
+  images: ImageAttachment[];
   provider: ModelProvider;
   model: string;
-  cwd: string;
   permissionMode: PermissionMode;
   effort?: EffortLevel;
   ultracode?: boolean;
-  prompt: string;
-  images: ImageAttachment[];
-  resumeId?: string;
 }
 
 export interface WorktreeRequest {
@@ -316,25 +319,7 @@ export interface CoordinatorState {
 export interface OpenProject {
   path: string;
   name: string;
-  state: CoordinatorState | null;
-}
-
-export function createInitialState(projectName: string, projectPath: string): CoordinatorState {
-  const projectId = 1;
-  return {
-    next_id: 1,
-    projects: { [projectId]: { id: projectId, name: projectName } },
-    worktrees: {},
-    sessions: {},
-    connections: {},
-    events: [],
-    messages: [],
-    approvals: [],
-    tasks: {},
-    artifacts: {},
-    outputs: [],
-    conflicts: [],
-  };
+  state: CoordinatorState;
 }
 
 export function sortedWorktrees(state: CoordinatorState) {

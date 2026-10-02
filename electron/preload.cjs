@@ -12,12 +12,19 @@ contextBridge.exposeInMainWorld("milagre", {
     ipcRenderer.on("worktree:renamed", listener);
     return () => ipcRenderer.removeListener("worktree:renamed", listener);
   },
-  readDiffStat: (worktreePath, base) => ipcRenderer.invoke("worktree:diffstat", worktreePath, base),
   revealWorktree: (worktreePath) => ipcRenderer.invoke("worktree:reveal", worktreePath),
   getCurrentProject: () => ipcRenderer.invoke("project:current"),
   openProject: () => ipcRenderer.invoke("project:open"),
-  saveProject: (projectPath, state) => ipcRenderer.invoke("project:save", projectPath, state),
-  startTurn: (request) => ipcRenderer.invoke("agent:start-turn", request),
+  readProject: (projectPath) => ipcRenderer.invoke("project:read", projectPath),
+  onProjectState: (callback) => {
+    const listener = (_event, update) => callback(update);
+    ipcRenderer.on("project:state", listener);
+    return () => ipcRenderer.removeListener("project:state", listener);
+  },
+  sendMessage: (request) => ipcRenderer.invoke("chat:send", request),
+  patchChat: (projectPath, sessionId, patch) => ipcRenderer.invoke("chat:patch", projectPath, sessionId, patch),
+  setOpenChat: (chatId) => ipcRenderer.invoke("chat:set-open", chatId),
+  getRuns: () => ipcRenderer.invoke("chat:runs"),
   getModels: () => ipcRenderer.invoke("agent:models"),
   getCliStatus: () => ipcRenderer.invoke("agent:cli-status"),
   interruptAgent: (chatId) => ipcRenderer.invoke("agent:interrupt", chatId),

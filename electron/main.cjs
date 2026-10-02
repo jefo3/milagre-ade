@@ -16,11 +16,16 @@ const { failedWith, loginMessage } = require("./agents/events.cjs");
 const { createModelCache } = require("./agents/models.cjs");
 const { cliWhenLoggedIn, createCliStatus } = require("./agents/status.cjs");
 const { SessionManager } = require("./agents/session-manager.cjs");
+const { ChatHost } = require("./agents/chat-host.cjs");
 const { discoverSkills, expandSkillPrompt } = require("./skills.cjs");
 const { createWorktree, listBranches, renameWorktreeBranch } = require("./worktrees.cjs");
 const { suggestWorktreeName } = require("./worktree-name.cjs");
 const { readDiffStat } = require("./diffstat.cjs");
 const { reconcileState } = require("./project-state.cjs");
+const { ProjectStates } = require("./project-states.cjs");
+const { DiffRefresher } = require("./diff-refresh.cjs");
+const { projectOfKey, sessionIdFromKey } = require("./shared/agent-runs.mjs");
+const { patchSession, renameWorktree } = require("./shared/project-edits.mjs");
 const { resolveProjectImage } = require("./project-image.cjs");
 const { saveProjectState, stateFile } = require("./project-store.cjs");
 const { createUsageReader } = require("./usage.cjs");
@@ -82,17 +87,45 @@ async function discoverWorktrees(projectPath) {
   }
 }
 
-async function readProject(projectPath) {
-  const name = path.basename(projectPath) || "Untitled project";
-  let storedState = null;
+async function readStoredState(projectPath) {
   try {
-    const contents = await fs.readFile(stateFile(projectPath), "utf8");
-    storedState = JSON.parse(contents);
-  } catch {}
-  const discoveredWorktrees = await discoverWorktrees(projectPath);
-  const state = reconcileState(storedState, name, discoveredWorktrees);
-  if (storedState && JSON.stringify(storedState) !== JSON.stringify(state)) await saveProjectState(projectPath, state);
-  return { path: projectPath, name, state };
+    return JSON.parse(await fs.readFile(stateFile(projectPath), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+const projectName = (projectPath) => path.basename(projectPath) || "Untitled project";
+
+// Every project's state goes through here: the main process is its only writer (see ADR-0001).
+const states = new ProjectStates({
+  read: async (projectPath) => reconcileState(await readStoredState(projectPath), projectName(projectPath), await discoverWorktrees(projectPath)),
+  save: saveProjectState,
+});
+
+function broadcastProjectState(projectPath, state) {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
+    window.webContents.send("project:state", { path: projectPath, state });
+  }
+}
+
+/** Applies a change to a project's state and tells the windows when it changed. */
+async function updateProject(projectPath, change) {
+  const result = await states.update(projectPath, change);
+  if (result.changed) broadcastProjectState(projectPath, result.state);
+  return result.state;
+}
+
+const diffs = new DiffRefresher({ states, readDiffStat, update: updateProject });
+
+// Reading a project matches its worktrees with the ones git lists now. A project read before keeps the
+// state this run has built, so a chat's turn that's still running isn't lost.
+async function readProject(projectPath) {
+  const discovered = await discoverWorktrees(projectPath);
+  const state = await updateProject(projectPath, (current) => reconcileState(current, projectName(projectPath), discovered));
+  void diffs.refresh(projectPath).catch(() => {});
+  return { path: projectPath, name: projectName(projectPath), state };
 }
 
 ipcMain.handle("skills:list", (_event, projectPath) => discoverSkills(projectPath));
@@ -112,7 +145,9 @@ async function nameWorktree(sender, projectPath, created, prompt) {
   const cli = await agentCli("claude");
   const slug = await suggestWorktreeName(prompt, { command: cli.problem ? null : cli.command, timeoutMs: 15_000 });
   const name = await renameWorktreeBranch({ worktreePath: created.path, branch: created.branch, slug });
-  if (name && !sender.isDestroyed()) sender.send("worktree:renamed", { projectPath, path: created.path, from: created.branch, name });
+  if (!name) return;
+  await updateProject(projectPath, (state) => renameWorktree(state, { path: created.path, from: created.branch, name }));
+  if (!sender.isDestroyed()) sender.send("worktree:renamed", { projectPath, path: created.path, from: created.branch, name });
 }
 
 ipcMain.handle("worktree:create", async (event, request) => {
@@ -120,13 +155,13 @@ ipcMain.handle("worktree:create", async (event, request) => {
   const project = await readProject(request.projectPath);
   const listed = Object.values(project.state.worktrees).find((item) => item.name === created.branch);
   if (!listed) throw new Error(`Created ${created.branch}, but git did not list it as a worktree.`);
-  const worktree = { ...listed, base: created.base };
-  project.state.worktrees[worktree.id] = worktree;
-  await saveProjectState(request.projectPath, project.state);
+  const state = await updateProject(request.projectPath, (latest) => {
+    const worktree = latest.worktrees[listed.id];
+    return worktree ? { ...latest, worktrees: { ...latest.worktrees, [worktree.id]: { ...worktree, base: created.base } } } : latest;
+  });
   void nameWorktree(event.sender, request.projectPath, created, request.prompt ?? "").catch(() => {});
-  return { project, worktreeId: worktree.id };
+  return { project: { ...project, state }, worktreeId: listed.id };
 });
-ipcMain.handle("worktree:diffstat", (_event, worktreePath, base) => readDiffStat(worktreePath, base));
 // Only a git checkout's top folder opens, so the renderer can't open arbitrary paths.
 ipcMain.handle("worktree:reveal", async (_event, worktreePath) => {
   const { stdout } = await execFileAsync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
@@ -154,8 +189,9 @@ const notifier = new AttentionNotifier({
 
 ipcMain.handle("notification:attention", (_event, notice) => (Notification.isSupported() ? notifier.notify(notice) : false));
 
-function sendAgentEvent(chatId, event) {
+function publishAgentEvent(chatId, event, state, seq) {
   notifier.observe(chatId, event);
+  diffs.observe(chatId, event);
   // A turn that just failed on a login problem makes a "ready" picker status out of date.
   if (event.type === "turn-failed" && event.login) {
     for (const name of ["claude", "codex"]) if (event.message === loginMessage(name)) agentCliStatus.invalidate(name);
@@ -163,7 +199,7 @@ function sendAgentEvent(chatId, event) {
   for (const window of BrowserWindow.getAllWindows()) {
     // A window can be mid-teardown while agents shut down on quit.
     if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
-    window.webContents.send("agent:event", { chatId, event });
+    window.webContents.send("agent:event", { chatId, event, ...(state ? { state } : {}), ...(seq ? { seq } : {}) });
   }
 }
 
@@ -171,8 +207,22 @@ const agents = new SessionManager({
   createSession: (provider, options) => (provider === "codex"
     ? new CodexSession({ ...options, clientVersion: app.getVersion() })
     : new ClaudeSession(options)),
-  send: sendAgentEvent,
+  send: (chatId, event) => void chats.receive(chatId, event),
 });
+
+async function startAgentTurn(request) {
+  const images = decodeImages(request.images);
+  const prompt = await expandSkillPrompt(request.cwd, request.prompt);
+  const cli = await agentCli(request.provider === "codex" ? "codex" : "claude");
+  // A CLI that is missing, too old or doesn't start fails the turn like any other failure, with its own message.
+  if (cli.problem) {
+    await chats.receive(request.chatId, failedWith(cli.problem));
+    return { turnId: null, steered: false };
+  }
+  return agents.startTurn({ ...request, prompt, images, command: cli.command });
+}
+
+const chats = new ChatHost({ states, startTurn: startAgentTurn, publish: publishAgentEvent });
 
 // Each CLI is found and its version checked once per run; a missing or outdated one is checked again on the next message.
 const agentCli = createCliCache({ ready: () => environmentReady, refresh: () => refreshInstallPath() });
@@ -180,17 +230,18 @@ const agentCli = createCliCache({ ready: () => environmentReady, refresh: () => 
 ipcMain.handle("usage:read", () => readUsage());
 ipcMain.handle("usage:cached", () => cachedSnapshot(usageStore, Date.now()));
 
-ipcMain.handle("agent:start-turn", async (_event, request) => {
-  const images = decodeImages(request.images);
-  const prompt = await expandSkillPrompt(request.cwd, request.prompt);
-  const cli = await agentCli(request.provider === "codex" ? "codex" : "claude");
-  // A CLI that is missing, too old or doesn't start fails the turn like any other failure, with its own message.
-  if (cli.problem) {
-    sendAgentEvent(request.chatId, failedWith(cli.problem));
-    return { turnId: null, steered: false };
-  }
-  return agents.startTurn({ ...request, prompt, images, command: cli.command });
+ipcMain.handle("chat:send", (_event, request) => {
+  if (!states.has(request?.projectPath)) throw new Error("Open the project before sending to its chats.");
+  return chats.send(request);
 });
+ipcMain.handle("chat:patch", (_event, projectPath, sessionId, patch) => (states.has(projectPath) ? updateProject(projectPath, (state) => patchSession(state, sessionId, patch ?? {})).then(() => {}) : undefined));
+// Opening a chat reads it. Only on opening: "Mark as unread" on the open chat sticks until it's opened again.
+ipcMain.handle("chat:set-open", async (_event, chatId) => {
+  chats.setOpenChat(chatId);
+  if (typeof chatId === "string" && states.has(projectOfKey(chatId))) await updateProject(projectOfKey(chatId), (state) => patchSession(state, sessionIdFromKey(chatId), { unread: false }));
+});
+// A window that loads (or reloads) mid-turn picks the turns up where they are, cards included.
+ipcMain.handle("chat:runs", () => chats.snapshot());
 
 // What the model picker flags per agent: missing, outdated, broken or logged out. A ready CLI is looked at again
 // after 5 minutes, a problem on every call.
@@ -228,13 +279,8 @@ function createWindow() {
   const indexFile = path.join(__dirname, "../dist/index.html");
   const appUrl = app.isPackaged ? pathToFileURL(indexFile).href : process.env.MILAGRE_DEV_SERVER_URL || "http://127.0.0.1:5173";
   guardNavigation(window.webContents, { appUrl, openExternal: (url) => shell.openExternal(url).catch(() => {}) });
-  // A reload starts the renderer with no running turns, so stop the agents' turns: none may keep
-  // waiting on an approval or question card that no longer exists.
-  let loaded = false;
-  window.webContents.on("did-finish-load", () => {
-    if (loaded) void agents.interruptAll().catch(() => {});
-    loaded = true;
-  });
+  // A reload keeps every turn running: the main process saves them, and the renderer takes the
+  // turns streaming now, with their approval and question cards, from "chat:runs".
   if (!app.isPackaged) {
     window.loadURL(appUrl);
   } else {
@@ -251,7 +297,8 @@ ipcMain.handle("project:open", async () => {
   if (result.canceled || !result.filePaths[0]) return null;
   return readProject(result.filePaths[0]);
 });
-ipcMain.handle("project:save", (_event, projectPath, state) => saveProjectState(projectPath, state));
+// Only a project already read this run can be read again by path, so the renderer can't open arbitrary folders.
+ipcMain.handle("project:read", (_event, projectPath) => (states.has(projectPath) ? readProject(projectPath) : null));
 
 app.whenReady().then(async () => {
   app.setName("Milagre");
@@ -260,6 +307,7 @@ app.whenReady().then(async () => {
     if (!appIcon.isEmpty()) app.dock.setIcon(appIcon);
   }
   createWindow();
+  app.on("browser-window-focus", () => diffs.focused());
   autoUpdater.on("update-available", (info) => publishUpdateState({ status: "downloading", version: info.version }));
   autoUpdater.on("download-progress", (progress) => publishUpdateState({ status: "downloading", progress: progress.percent }));
   autoUpdater.on("update-downloaded", (info) => publishUpdateState({ status: "downloaded", version: info.version, progress: 100 }));
@@ -271,7 +319,7 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   notifier.closeAll();
-  // The renderer saves finished turns, so running turns stop with the last window.
+  // No window is left to answer an approval or question, so running turns stop (and are saved) with the last one.
   void agents.closeAll();
   if (process.platform !== "darwin") app.quit();
 });
@@ -282,5 +330,6 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   agentsClosed = true;
   // Agents run in their own process groups, so stop them before the app exits.
-  Promise.race([agents.closeAll(), new Promise((resolve) => setTimeout(resolve, 5000))]).finally(() => app.quit());
+  // Their cancelled turns are saved before the app exits.
+  Promise.race([agents.closeAll().then(() => states.flush()), new Promise((resolve) => setTimeout(resolve, 5000))]).finally(() => app.quit());
 });

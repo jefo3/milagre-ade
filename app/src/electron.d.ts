@@ -1,8 +1,9 @@
 export {};
 
+import type { AgentRuns } from "./lib/agent-runs";
 import type { AttentionNotice } from "./lib/attention";
-import type { WorktreeRename } from "./lib/worktree-rename";
-import type { AgentCliStatus, AgentModels, DiffStat, AgentEvent, AgentStartTurnRequest, CoordinatorState, OpenProject, PermissionDecision, PermissionMode, QuestionAnswers, SkillCatalog, UsageSnapshot, WorktreeRequest } from "./model";
+import type { SessionPatch, WorktreeRename } from "../../electron/shared/project-edits.mjs";
+import type { AgentCliStatus, AgentModels, AgentEvent, ChatSendRequest, CoordinatorState, OpenProject, PermissionDecision, PermissionMode, QuestionAnswers, SkillCatalog, UsageSnapshot, WorktreeRequest } from "./model";
 
 export type UpdateState = { status: "idle" | "checking" | "up-to-date" | "downloading" | "downloaded" | "error"; version: string | null; progress: number };
 
@@ -17,14 +18,21 @@ declare global {
       createWorktree: (request: WorktreeRequest) => Promise<{ project: OpenProject & { state: CoordinatorState }; worktreeId: number }>;
       /** A new worktree's branch got the name picked for its chat, a few seconds after it was created. */
       onWorktreeRenamed: (callback: (rename: WorktreeRename) => void) => () => void;
-      /** Lines the worktree adds and removes against its base, or null outside a repository. */
-      readDiffStat: (worktreePath: string, base?: string) => Promise<DiffStat | null>;
       /** Opens the worktree's folder in Finder. */
       revealWorktree: (worktreePath: string) => Promise<void>;
       getCurrentProject: () => Promise<OpenProject>;
       openProject: () => Promise<OpenProject | null>;
-      saveProject: (projectPath: string, state: CoordinatorState) => Promise<void>;
-      startTurn: (request: AgentStartTurnRequest) => Promise<{ turnId: string | null; steered: boolean }>;
+      /** Reads a project opened before in this run again, or null for any other path. */
+      readProject: (projectPath: string) => Promise<OpenProject | null>;
+      /** A project's state changed in the main process, its only writer. Changes made by agent events come with the event instead. */
+      onProjectState: (callback: (update: { path: string; state: CoordinatorState }) => void) => () => void;
+      /** Saves a message in its chat (a new one when `sessionId` is null), then starts or steers the chat's turn. */
+      sendMessage: (request: ChatSendRequest) => Promise<{ sessionId: number }>;
+      patchChat: (projectPath: string, sessionId: number, patch: SessionPatch) => Promise<void>;
+      /** The chat on screen, by chat key, which opening reads; a turn that ends in any other chat leaves it unread. */
+      setOpenChat: (chatId: string | null) => Promise<void>;
+      /** The turns streaming now, in every project, and the number of the last agent event they hold. */
+      getRuns: () => Promise<{ runs: AgentRuns; seq: number }>;
       respondToPermission: (chatId: string, requestId: string, decision: PermissionDecision) => Promise<boolean>;
       /** Sends the answers to a question card, or dismisses it (null). False when the question is gone. */
       answerQuestion: (chatId: string, requestId: string, answers: QuestionAnswers | null) => Promise<boolean>;
@@ -34,13 +42,13 @@ declare global {
       /** How each agent's CLI stands (missing, outdated, broken, logged out, or ready); checked again on every call while it has a problem. */
       getCliStatus: () => Promise<AgentCliStatus>;
       interruptAgent: (chatId: string) => Promise<void>;
-      onAgentEvent: (callback: (payload: { chatId: string; event: AgentEvent }) => void) => () => void;
+      /** An agent event, with its project's new state when the event changed it, and its number once it's folded into the main process's runs (see getRuns). */
+      onAgentEvent: (callback: (payload: { chatId: string; event: AgentEvent; state?: CoordinatorState; seq?: number }) => void) => () => void;
       getUpdateState: () => Promise<UpdateState>;
       installUpdate: () => Promise<void>;
       onUpdateState: (callback: (state: UpdateState) => void) => () => void;
       readUsage: () => Promise<UsageSnapshot>;
       getCachedUsage: () => Promise<UsageSnapshot>;
-      /** Shows a system notification for a request a chat waits on, unless Milagre has focus. True when one showed. */
       notifyAttention: (notice: AttentionNotice & { chatId: string; requestId: string }) => Promise<boolean>;
       /** A notification was clicked: the window is back, and the chat it was about should open. */
       onOpenChat: (callback: (chatId: string) => void) => () => void;
