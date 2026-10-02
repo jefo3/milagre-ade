@@ -10,7 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "start": "node scripts/launch-electron.cjs",
     "typecheck": "tsc --noEmit",
-    "test:agent": "node --test electron/*.test.cjs electron/agents/*.test.cjs app/src/lib/*.test.ts",
+    "test:agent": "node --test electron/*.test.cjs electron/agents/*.test.cjs electron/shared/*.test.ts app/src/lib/*.test.ts",
     "test:chat-layout": "node scripts/test-chat-layout.cjs",
     "test:ui": "node --test \"app/src/**/*.test.ts\"",
     "release": "semantic-release",
