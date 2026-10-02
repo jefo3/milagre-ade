@@ -26,6 +26,7 @@ const { ProjectStates } = require("./project-states.cjs");
 const { DiffRefresher } = require("./diff-refresh.cjs");
 const { projectOfKey, sessionIdFromKey } = require("./shared/agent-runs.mjs");
 const { patchSession, renameWorktree } = require("./shared/project-edits.mjs");
+const { attentionContext, attentionNotice } = require("./shared/attention.mjs");
 const { resolveProjectImage } = require("./project-image.cjs");
 const { saveProjectState, stateFile } = require("./project-store.cjs");
 const { createUsageReader } = require("./usage.cjs");
@@ -187,10 +188,23 @@ const notifier = new AttentionNotifier({
   openChat: openChatFromNotification,
 });
 
-ipcMain.handle("notification:attention", (_event, notice) => (Notification.isSupported() ? notifier.notify(notice) : false));
+// The window reports the "Notify when waiting" setting, kept with its other settings.
+let notifyWhenWaiting = true;
+ipcMain.handle("settings:notify-when-waiting", (_event, on) => {
+  notifyWhenWaiting = on === true;
+});
+
+// A chat that waits on the user while Milagre is in the background gets a system notification, whatever its project.
+async function notifyIfWaiting(chatId, event) {
+  const projectPath = projectOfKey(chatId);
+  if (!notifyWhenWaiting || !Notification.isSupported() || !states.has(projectPath) || !("requestId" in event)) return;
+  const notice = attentionNotice(event, attentionContext(await states.get(projectPath), projectName(projectPath), sessionIdFromKey(chatId)));
+  if (notice) notifier.notify({ chatId, requestId: event.requestId, ...notice });
+}
 
 function publishAgentEvent(chatId, event, state, seq) {
   notifier.observe(chatId, event);
+  void notifyIfWaiting(chatId, event).catch(() => {});
   diffs.observe(chatId, event);
   // A turn that just failed on a login problem makes a "ready" picker status out of date.
   if (event.type === "turn-failed" && event.login) {

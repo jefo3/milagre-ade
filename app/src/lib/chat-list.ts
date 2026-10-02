@@ -1,4 +1,4 @@
-import type { AgentSession, ChatMessage } from "../model";
+export { chatTitle } from "../../../electron/shared/chats.mjs";
 
 /** What the mark at the left of a chat row shows; the first that applies wins. */
 export type ChatMark = "waiting" | "running" | "unread" | "idle";
@@ -8,14 +8,6 @@ export function chatMark({ waiting, running, unread }: { waiting: boolean; runni
   if (running) return "running";
   if (unread) return "unread";
   return "idle";
-}
-
-/** The chat's name: the one the user gave it, else the first line of its first message. */
-export function chatTitle(session: AgentSession, messages: ChatMessage[]): string {
-  if (session.title?.trim()) return session.title.trim();
-  const line = messages.find((message) => message.role !== "assistant" && message.body.trim())?.body.trim().split("\n")[0] ?? "";
-  if (!line) return session.agent_name;
-  return line.length > 60 ? `${line.slice(0, 57)}…` : line;
 }
 
 /** A line count in a few characters: 980, 2.1k, 14k, 2.1m. */

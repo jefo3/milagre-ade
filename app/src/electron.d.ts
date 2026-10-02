@@ -1,7 +1,6 @@
 export {};
 
 import type { AgentRuns } from "./lib/agent-runs";
-import type { AttentionNotice } from "./lib/attention";
 import type { SessionPatch, WorktreeRename } from "../../electron/shared/project-edits.mjs";
 import type { AgentCliStatus, AgentModels, AgentEvent, ChatSendRequest, CoordinatorState, OpenProject, PermissionDecision, PermissionMode, QuestionAnswers, SkillCatalog, UsageSnapshot, WorktreeRequest } from "./model";
 
@@ -49,7 +48,8 @@ declare global {
       onUpdateState: (callback: (state: UpdateState) => void) => () => void;
       readUsage: () => Promise<UsageSnapshot>;
       getCachedUsage: () => Promise<UsageSnapshot>;
-      notifyAttention: (notice: AttentionNotice & { chatId: string; requestId: string }) => Promise<boolean>;
+      /** Whether a chat that waits on the user while Milagre is in the background gets a system notification. */
+      setNotifyWhenWaiting: (on: boolean) => Promise<void>;
       /** A notification was clicked: the window is back, and the chat it was about should open. */
       onOpenChat: (callback: (chatId: string) => void) => () => void;
     };

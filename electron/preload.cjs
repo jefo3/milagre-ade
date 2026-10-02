@@ -45,7 +45,7 @@ contextBridge.exposeInMainWorld("milagre", {
   },
   readUsage: () => ipcRenderer.invoke("usage:read"),
   getCachedUsage: () => ipcRenderer.invoke("usage:cached"),
-  notifyAttention: (notice) => ipcRenderer.invoke("notification:attention", notice),
+  setNotifyWhenWaiting: (on) => ipcRenderer.invoke("settings:notify-when-waiting", on),
   onOpenChat: (callback) => {
     const listener = (_event, chatId) => callback(chatId);
     ipcRenderer.on("notification:open-chat", listener);

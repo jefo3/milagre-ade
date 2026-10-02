@@ -20,7 +20,6 @@ import {
   sortedWorktrees,
 } from "./model";
 import { useAgentRuns } from "./components/useAgentRuns";
-import { attentionNotice } from "./lib/attention";
 import { chatInProject, chatKey, chatsRunning, chatsWaitingForUser, lastUserModel, modelForChat, projectOfKey, sentDecision, sentReply, sessionIdFromKey } from "./lib/agent-runs";
 import { capabilitiesFrom, keepIfSame, mergeModels, nextSelection } from "./lib/models";
 import { chatMark, chatTitle } from "./lib/chat-list";
@@ -156,7 +155,7 @@ function App() {
   const run = project && selectedSession ? agentRuns.runs[chatKey(project.path, selectedSession.id)] : undefined;
   const isSending = preparing || Boolean(run);
   const usage = useUsage();
-  const { showUsageInSidebar } = useSettings();
+  const { showUsageInSidebar, notifyWhenWaiting } = useSettings();
   const runningCount = Object.keys(agentRuns.runs).length;
   const previousRunningCount = useRef(runningCount);
 
@@ -261,21 +260,10 @@ function App() {
     if (worktree) void window.milagre.revealWorktree(worktree.path).catch(() => {});
   }
 
-  // A chat that waits on the user while Milagre is in the background gets a system notification, whatever its project.
-  useEffect(() => window.milagre.onAgentEvent(({ chatId, event }) => {
-    const projectPath = projectOfKey(chatId);
-    if (!getSettings().notifyWhenWaiting) return;
-    // A project this window hasn't been sent yet is named by its folder alone.
-    const latest = statesRef.current[projectPath];
-    const session = latest?.sessions[sessionIdFromKey(chatId)];
-    const notice = attentionNotice(event, {
-      projectName: projectRef.current?.path === projectPath ? projectRef.current.name : projectPath.split("/").filter(Boolean).at(-1) ?? projectPath,
-      worktreeName: session ? latest?.worktrees[session.worktree_id]?.name : undefined,
-      chatTitle: session && latest ? chatTitle(session, latest.messages.filter((message) => message.session_id === session.id)) : undefined,
-      provider: session?.provider,
-    });
-    if (notice && "requestId" in event) void window.milagre.notifyAttention({ chatId, requestId: event.requestId, ...notice }).catch(() => {});
-  }), []);
+  // The main process notifies about a chat that waits on the user while Milagre is in the background.
+  useEffect(() => {
+    void window.milagre.setNotifyWhenWaiting(notifyWhenWaiting).catch(() => {});
+  }, [notifyWhenWaiting]);
 
   // A new worktree's branch is renamed a few seconds in, once its chat's name is picked; the main process saves the new name.
   useEffect(() => window.milagre.onWorktreeRenamed((rename) => {
